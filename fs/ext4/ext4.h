@@ -1179,6 +1179,9 @@ struct ext4_inode_info {
 							    * commits
 							    */
 
+#define EXT4_MOUNT2_FREESPACE_TREE	0x00000040 /* Enable rb-tree for free-space organization*/
+
+
 #define clear_opt(sb, opt)		EXT4_SB(sb)->s_mount_opt &= \
 						~EXT4_MOUNT_##opt
 #define set_opt(sb, opt)		EXT4_SB(sb)->s_mount_opt |= \

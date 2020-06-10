@@ -529,6 +529,29 @@ static ssize_t queue_dax_show(struct request_queue *q, char *page)
 	return queue_var_show(blk_queue_dax(q), page);
 }
 
+static ssize_t queue_split_granularity_show(struct request_queue *q, char *page)
+{
+	return queue_var_show(q->split_granularity, page);
+}
+
+static ssize_t queue_split_granularity_store(struct request_queue *q, const char *page,
+						size_t count)
+{
+	unsigned long split_granularity;
+	int ret;
+
+	ret = queue_var_store(&split_granularity, page, count);
+	if (ret < 0)
+		return ret;
+
+	/* split_granularity can only be a power of 2 */
+	if (split_granularity & (split_granularity - 1))
+		return -EINVAL;
+
+	q->split_granularity = split_granularity;
+	return count;
+}
+
 static struct queue_sysfs_entry queue_requests_entry = {
 	.attr = {.name = "nr_requests", .mode = 0644 },
 	.show = queue_requests_show,
@@ -727,6 +750,12 @@ static struct queue_sysfs_entry throtl_sample_time_entry = {
 };
 #endif
 
+static struct queue_sysfs_entry queue_split_granularity = {
+	.attr = {.name = "split_granularity", .mode = 0644 },
+	.show = queue_split_granularity_show,
+	.store = queue_split_granularity_store,
+};
+
 static struct attribute *queue_attrs[] = {
 	&queue_requests_entry.attr,
 	&queue_ra_entry.attr,
@@ -766,6 +795,7 @@ static struct attribute *queue_attrs[] = {
 #ifdef CONFIG_BLK_DEV_THROTTLING_LOW
 	&throtl_sample_time_entry.attr,
 #endif
+	&queue_split_granularity.attr,
 	NULL,
 };
 

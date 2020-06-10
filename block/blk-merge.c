@@ -106,6 +106,7 @@ static struct bio *blk_bio_write_zeroes_split(struct request_queue *q,
 		struct bio *bio, struct bio_set *bs, unsigned *nsegs)
 {
 	*nsegs = 0;
+	sector_t split;
 
 	if (!q->limits.max_write_zeroes_sectors)
 		return NULL;
@@ -113,7 +114,14 @@ static struct bio *blk_bio_write_zeroes_split(struct request_queue *q,
 	if (bio_sectors(bio) <= q->limits.max_write_zeroes_sectors)
 		return NULL;
 
-	return bio_split(bio, q->limits.max_write_zeroes_sectors, GFP_NOIO, bs);
+	split = bio_sectors(bio);
+	if (q->split_granularity >> 9)
+		split = round_down(split, q->split_granularity >> 9);
+
+	if (!split)
+		return NULL;
+
+	return bio_split(bio, split, GFP_NOIO, bs);
 }
 
 static struct bio *blk_bio_write_same_split(struct request_queue *q,
@@ -122,11 +130,19 @@ static struct bio *blk_bio_write_same_split(struct request_queue *q,
 					    unsigned *nsegs)
 {
 	*nsegs = 1;
+	sector_t split;
 
 	if (!q->limits.max_write_same_sectors)
 		return NULL;
 
 	if (bio_sectors(bio) <= q->limits.max_write_same_sectors)
+		return NULL;
+
+	split = bio_sectors(bio);
+	if (q->split_granularity >> 9)
+		split = round_down(split, q->split_granularity >> 9);
+
+	if (!split)
 		return NULL;
 
 	return bio_split(bio, q->limits.max_write_same_sectors, GFP_NOIO, bs);
@@ -222,6 +238,33 @@ static bool bvec_split_segs(const struct request_queue *q,
 	return len > 0 || bv->bv_len > max_len;
 }
 
+void bvec_split_segs_aligned(struct request_queue *q,
+			    const struct bio_vec *bv, unsigned *nsegs,
+			    unsigned *sectors, unsigned max_segs,
+			    unsigned max_sectors)
+{
+	unsigned sector_granularity =
+	q->split_granularity ? (q->split_granularity >> 9) : 0;
+	unsigned old_sectors;
+
+	if (!sector_granularity || nsegs >= max_segs)
+		return;
+	if (*sectors / sector_granularity ==
+		(*sectors + (bv->bv_len >> 9)) / sector_granularity)
+		return;
+
+	old_sectors = *sectors2;
+	sectors2 = round_down(
+		sectors + (bv.bv_len >> 9),
+		sector_granularity);
+	if ((((sectors2 - old_sectors) << 9) +
+		bv.bv_offset > PAGE_SIZE) ||
+		(sectors2 > max_sectors))
+		sectors2 = old_sectors;
+	nsegs2 = nsegs + 1;
+}
+
+}
 /**
  * blk_bio_segment_split - split a bio in two bios
  * @q:    [in] request queue pointer
@@ -248,7 +291,10 @@ static struct bio *blk_bio_segment_split(struct request_queue *q,
 {
 	struct bio_vec bv, bvprv, *bvprvp = NULL;
 	struct bvec_iter iter;
-	unsigned nsegs = 0, sectors = 0;
+	unsigned nsegs = 0, nsegs2 = 0;
+	unsigned sectors = 0, sectors2 = 0, old_sectors = 0;
+	unsigned sector_granularity =
+		q->split_granularity ? (q->split_granularity >> 9) : 0;
 	const unsigned max_sectors = get_max_io_size(q, bio);
 	const unsigned max_segs = queue_max_segments(q);
 
@@ -264,10 +310,32 @@ static struct bio *blk_bio_segment_split(struct request_queue *q,
 		    sectors + (bv.bv_len >> 9) <= max_sectors &&
 		    bv.bv_offset + bv.bv_len <= PAGE_SIZE) {
 			nsegs++;
-			sectors += bv.bv_len >> 9;
-		} else if (bvec_split_segs(q, &bv, &nsegs, &sectors, max_segs,
-					 max_sectors)) {
-			goto split;
+			old_sectors = sectors;
+			sectors += (bv.bv_len >> 9);
+			if (sector_granularity &&
+				(old_sectors / sector_granularity !=
+					sectors / sector_granularity)) {
+				/* This is a valid split point */
+				nsegs2 = nsegs;
+				sectors2 = round_down(sectors, sector_granularity);
+			}
+		} else {
+			if ((sector_granularity) && (nsegs < max_segs) &&
+				(sectors / sector_granularity !=
+					(sectors + (bv.bv_len >> 9)))) {
+				old_sectors = sectors2;
+				sectors2 = round_down(
+					sectors + (bv.bv_len >> 9),
+					sector_granularity);
+				if ((((sectors2 - old_sectors) << 9) +
+					bv.bv_offset > PAGE_SIZE) ||
+					(sectors2 > max_sectors))
+					sectors2 = old_sectors;
+				nsegs2 = nsegs + 1;
+			}
+			if (bvec_split_segs(q, &bv, &nsegs, &sectors, max_segs,
+					 max_sectors))
+				goto split;
 		}
 
 		bvprv = bv;
@@ -278,7 +346,11 @@ static struct bio *blk_bio_segment_split(struct request_queue *q,
 	return NULL;
 split:
 	*segs = nsegs;
-	return bio_split(bio, sectors, GFP_NOIO, bs);
+	if (sector_granularity && sectors2 == 0)
+		return NULL;
+	*segs = sector_granularity ? nsegs2 : nsegs;
+
+	return bio_split(bio, sector_granularity ? sectors2 : sectors, GFP_NOIO, bs);
 }
 
 /**

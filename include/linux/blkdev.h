@@ -473,6 +473,7 @@ struct request_queue {
 	void			*dma_drain_buffer;
 	unsigned int		dma_pad_mask;
 	unsigned int		dma_alignment;
+	unsigned int		split_granularity;
 
 	unsigned int		rq_timeout;
 	int			poll_nsec;

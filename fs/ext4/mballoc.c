@@ -339,6 +339,7 @@ MODULE_PARM_DESC(mballoc_debug, "Debugging level for ext4's mballoc");
 static struct kmem_cache *ext4_pspace_cachep;
 static struct kmem_cache *ext4_ac_cachep;
 static struct kmem_cache *ext4_free_data_cachep;
+static struct kmem_cache *ext4_freespace_node_cachep;
 
 /* We create slab caches for groupinfo data structures based on the
  * superblock block size.  There will be one per mounted filesystem for
@@ -2461,7 +2462,7 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 		bh = ext4_read_block_bitmap(sb, group);
 		BUG_ON(IS_ERR_OR_NULL(bh));
 		memcpy(meta_group_info[i]->bb_bitmap, bh->b_data,
-			sb->s_blocksize);
+			sb->s_blocksize);	
 		put_bh(bh);
 	}
 #endif
@@ -2588,6 +2589,37 @@ static int ext4_groupinfo_create_slab(size_t size)
 	return 0;
 }
 
+/*
+ * Initialize sbi->ext4_free_space_root
+ */
+int ext4_mb_init_freespace_trees(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	ext4_group_t groups_count;
+	size_t flex_bg_count;
+	unsigned i, j;
+	int ret;
+
+	if(test_opt2(sb, EXT4_MOUNT2_FREESPACE_TREE) && sbi->s_log_groups_per_flex) {		
+		groups_count = ext4_get_groups_count(sb);
+		flex_bg_count = groups_count >> sbi->s_log_groups_per_flex;
+		
+		/* TODO: check if ext4_freespace_root is accessible, since it's declared in ext4.h */
+		i = flex_bg_count * sizeof(ext4_freespace_root);
+		sbi->s_mb_freespace_trees = (ext4_freespace_root *) kzalloc(i, GFP_KERNEL);
+		if (sbi->s_mb_freespace_trees == NULL){
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		for (j = 0; j < flex_bg_count; j++){
+			sbi->s_mb_freespace_trees[j].frsp_t_root = RB_ROOT;
+			spinlock_init(&(sbi->s_mb_freespace_trees[j].frsp_t_lock));
+		}
+	}
+	return ret;
+}
+
 int ext4_mb_init(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -2631,6 +2663,12 @@ int ext4_mb_init(struct super_block *sb)
 		max = max >> 1;
 		i++;
 	} while (i <= sb->s_blocksize_bits + 1);
+
+	/* init for freespace trees */
+	int err;
+	err = ext4_mb_init_freespace_trees(sb);
+	if(err):
+		goto out;
 
 	spin_lock_init(&sbi->s_md_lock);
 	spin_lock_init(&sbi->s_bal_lock);
@@ -2698,6 +2736,8 @@ out:
 	sbi->s_mb_offsets = NULL;
 	kfree(sbi->s_mb_maxs);
 	sbi->s_mb_maxs = NULL;
+	kfree(sbi->s_mb_freespace_trees);
+	sbi->s_mb_freespace_trees = NULL;
 	return ret;
 }
 

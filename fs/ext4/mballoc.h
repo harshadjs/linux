@@ -78,6 +78,16 @@ do {									\
 #define MB_DEFAULT_GROUP_PREALLOC	512
 
 
+/*
+ * Struct for tree node in freespace_tree
+ */
+struct ext4_freespace_node {
+	unsigned int offset; /* Start block offset w.r.t. current flexible group*/
+	unsigned int length; /* Length of free spaces */
+	struct rb_node node; 
+}
+
+
 struct ext4_free_data {
 	/* this links the free block information from sb_info */
 	struct list_head		efd_list;

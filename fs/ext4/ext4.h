@@ -1390,6 +1390,15 @@ struct ext4_super_block {
 	(sbi->s_encoding_flags & EXT4_ENC_STRICT_MODE_FL)
 
 /*
+ * Struct containing rb_node 
+ * for tracking free spaces using Red Black tree
+ */
+struct ext4_freespace_root {
+	struct rb_root frsp_t_root;
+	spinlock_t frsp_t_lock; 
+}
+
+/*
  * fourth extended-fs super-block data in memory
  */
 struct ext4_sb_info {
@@ -1523,6 +1532,9 @@ struct ext4_sb_info {
 	unsigned int s_log_groups_per_flex;
 	struct flex_groups * __rcu *s_flex_groups;
 	ext4_group_t s_flex_groups_allocated;
+
+	/* rb_tree roots for flex_groups */
+	struct ext4_freespace_root *s_mb_freespace_trees;
 
 	/* workqueue for reserved extent conversions (buffered io) */
 	struct workqueue_struct *rsv_conversion_wq;

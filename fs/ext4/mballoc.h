@@ -85,7 +85,7 @@ struct ext4_freespace_node {
 	unsigned int offset; /* Start block offset w.r.t. current flexible group*/
 	unsigned int length; /* Length of free spaces in number of clusters*/
 	struct rb_node node; 
-}
+};
 
 
 struct ext4_free_data {

@@ -2440,7 +2440,7 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 	
 
 	/* find all unused blocks in bitmap, convert them to new tree node */
-	while(bit < end) {  /* TODO: check edge case */
+	while(bit < end) {
 		bit = mb_find_next_zero_bit(bh->b_data, end, bit);
 		if (bit >= end)
 			break;	
@@ -2454,11 +2454,11 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		new_entry->offset = offset;
 		new_entry->length = EXT4_NUM_B2C(sbi, length);
 		new_node = &new_entry->node;
-		printk(KERN_ERR "new_entry:\noffset:%d\nlength:%d\n\n", new_entry->offset, new_entry->length);
+		printk(KERN_DEBUG "new_entry:\noffset:%d\nlength:%d\n\n", new_entry->offset, new_entry->length);
 
 		/* insert to tree */
 		spin_lock(&tree->frsp_t_lock);
-		printk(KERN_ERR "tree address: %px", tree);
+		printk(KERN_DEBUG "tree address: %px", tree);
 		err = ext4_mb_freespace_node_insert(&tree->frsp_t_root, new_entry);
 		spin_unlock(&tree->frsp_t_lock);
 		if (err) {
@@ -2474,17 +2474,12 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		if (prev){
 			struct ext4_freespace_node *prev_entry = rb_entry(prev, struct ext4_freespace_node, node);
 			if (ext4_mb_freespace_node_can_merge(sb, prev_entry, new_entry)) {
-				printk(KERN_ERR "Merge to left: %d %d\n", prev_entry->offset, new_entry->offset);
+				printk(KERN_DEBUG "Merge to left: %d %d\n", prev_entry->offset, new_entry->offset);
 				new_entry->offset = prev_entry->offset;
 				new_entry->length += prev_entry->length;
 				rb_erase(prev, &tree->frsp_t_root);
 				kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
-				printk(KERN_ERR "merged_entry offset & length: %d %d", new_entry->offset, new_entry->length);
-				/*if (err) {
-					printk(KERN_ERR "Group %u: Failed to merge node containing freeblocks starting at %u in Tree %u\n", 
-							group, offset, flex_idx);
-					return err;
-				}*/	
+				printk(KERN_DEBUG "merged entry starting at %d, total length = %d", new_entry->offset, new_entry->length);
 			}
 		}
 		spin_unlock(&tree->frsp_t_lock);
@@ -2495,17 +2490,11 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		if (right){
 			struct ext4_freespace_node *next_entry = rb_entry(right, struct ext4_freespace_node, node);
 			if (ext4_mb_freespace_node_can_merge(sb, new_entry, next_entry)) {
-				printk(KERN_ERR "Merge to right: %d %d\n", new_entry->offset, next_entry->offset);
+				printk(KERN_DEBUG "Merge to right: %d %d\n", new_entry->offset, next_entry->offset);
 				new_entry->length += next_entry->length;
 				rb_erase(right, &tree->frsp_t_root);
 				kmem_cache_free(ext4_freespace_node_cachep, next_entry);
-				printk(KERN_ERR "merged_entry offset & length: %d %d", new_entry->offset, new_entry->length);
-
-				/*if (err) {
-					printk(KERN_ERR "Group %u: Failed to merge node containing freeblocks starting at %u in Tree %u\n", 
-							group, offset, flex_idx);
-					return err;
-				}*/	
+				printk(KERN_DEBUG "merged entry starting at %d, total length = %d", new_entry->offset, new_entry->length);
 			}
 		}
 		spin_unlock(&tree->frsp_t_lock);
@@ -2527,8 +2516,6 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_group_info **meta_group_info;
 	struct kmem_cache *cachep = get_groupinfo_cache(sb->s_blocksize_bits);
-
-	printk(KERN_ERR "add_groupinfo: callling");
 
 	/*
 	 * First check if this group is the first of a reserved block.
@@ -2592,9 +2579,7 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 		/* map contents of bitmap into freespace trees*/
 		if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
 			int err;
-			printk(KERN_ERR "load_freespace_trees: before");
 			err = ext4_mb_load_freespace_trees(sb, group, bh);
-			printk(KERN_ERR "load_freespace_trees: after");
 			if (err){
 				put_bh(bh);
 				goto exit_freespace_tree;
@@ -2621,7 +2606,6 @@ exit_meta_group_info:
 	return -ENOMEM;
 exit_freespace_tree:
 	/* TODO: release what has been allocated in ext4_mb_load_frerespace_trees*/
-
 	return -ENOMEM;
 } /* ext4_mb_add_groupinfo */
 
@@ -2750,13 +2734,7 @@ int ext4_mb_init_freespace_trees(struct super_block *sb)
 		flex_bg_count = (groups_count >> sbi->s_es->s_log_groups_per_flex) + 1;
 	}
 	
-	/* TODO: check if ext4_freespace_root is accessible, since it's declared in ext4.h */
 	i = flex_bg_count * sizeof(struct ext4_freespace_root);
-
-	printk(KERN_ERR "groups_count: %d", groups_count);
-	printk(KERN_ERR "flex_bg_count: %ld", flex_bg_count);
-	printk(KERN_ERR "sizeof tree root: %ld", sizeof(struct ext4_freespace_root));
-	printk(KERN_ERR "root spaces to be allocated: %d", i);
 
 	sbi->s_mb_freespace_trees = (struct ext4_freespace_root *)kzalloc(i, GFP_KERNEL);
 	if (sbi->s_mb_freespace_trees == NULL){
@@ -2765,12 +2743,10 @@ int ext4_mb_init_freespace_trees(struct super_block *sb)
 	}
 
 	for (j = 0; j < flex_bg_count; j++){
-		printk(KERN_ERR "%d -th root: %px", j, &(sbi->s_mb_freespace_trees[j]));
 		sbi->s_mb_freespace_trees[j].frsp_t_root = RB_ROOT;
 		spin_lock_init(&(sbi->s_mb_freespace_trees[j].frsp_t_lock));
 	}
 
-	printk(KERN_ERR "init_freespace_trees: initialized all tree roots");
 	return ret;
 }
 
@@ -2818,14 +2794,10 @@ int ext4_mb_init(struct super_block *sb)
 		i++;
 	} while (i <= sb->s_blocksize_bits + 1);
 
-	printk(KERN_ERR "flex bg turned on: %d", ext4_has_feature_flex_bg(sb));
-	printk(KERN_ERR "log flex bg from s_es: %d", sbi->s_es->s_log_groups_per_flex);
 	/* init for freespace trees */
 	if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
 		int err;
-		printk(KERN_ERR "init_freespace_trees: calling");
 		err = ext4_mb_init_freespace_trees(sb);
-		printk(KERN_ERR "init_freespace_trees: called");
 		if(err){
 			goto out;
 		}
@@ -2883,9 +2855,7 @@ int ext4_mb_init(struct super_block *sb)
 	}
 
 	/* init file for buddy data */
-	printk(KERN_ERR "mb_init_backend: calling");
 	ret = ext4_mb_init_backend(sb);
-	printk(KERN_ERR "mb_init_backend: called");
 	if (ret != 0)
 		goto out_free_locality_groups;
 

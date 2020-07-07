@@ -2427,6 +2427,127 @@ int ext4_mb_freespace_node_can_merge(struct super_block *sb, struct ext4_freespa
 	return false;
 }
 
+/* fuzzy-search for freespace tree
+ * return target node if found node.offset == target
+ * return PREV node if no target node exists in tree
+ * return NULL
+ */
+struct rb_node *ext4_mb_fuzzy_search_freespace_trees(struct super_block *sb, 
+				struct rb_root *root, unsigned int target)
+{
+	struct rb_node *node = root->rb_node;
+	struct rb_node *first = rb_first(root);
+	struct rb_node *left = NULL;
+	struct ext4_freespace_node *first_node = rb_entry(first, struct ext4_freespace_node, node);
+
+	/* edge case: target < rb_first */
+	if (target < first_node->offset)
+		return left;
+
+	while(node){
+		struct ext4_freespace_node *this = rb_entry(node, struct ext4_freespace_node, node);
+		if ((this->offset >= target) && (target <= this->offset + this->length)){
+			left = node;
+			break;
+		}
+		else if (target < this->offset)
+			node = node->rb_left;
+		else {
+			left = node;
+			node = node->rb_right;
+		}
+	}
+	return left;
+}
+
+
+/* serialize red black trees to bitmaps */
+int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void *bitmap)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int err = 0, i = 0, temp;
+	unsigned int node_end, node_start, start, end;
+	unsigned int flex_idx = group >> sbi->s_es->s_log_groups_per_flex;
+	struct ext4_freespace_node *cur = NULL, *first = NULL, *next = NULL;
+	struct rb_node *cur_node = NULL, *first_node = NULL, *next_node = NULL, *temp_node = NULL;
+	struct ext4_freespace_root *tree = &(sbi->s_mb_freespace_trees[flex_idx]);
+
+	start = (group - (flex_idx << ext4_flex_bg_size(sbi)))*sbi->s_blocks_per_group;
+	end = start + sbi->s_blocks_per_group;
+	i = i + start;
+
+	/* get the tree node covering (or to the left of) the start of block */
+	cur_node = ext4_mb_fuzzy_search_freespace_trees(sb, &tree->frsp_t_root, i);	
+
+	if (cur){
+		printk(KERN_ERR "cur->offset: %u", cur->offset);
+		unsigned int length_B = EXT4_C2B(sbi, cur->length);
+		printk(KERN_ERR "length in blocks: %u", length_B);
+	}
+	
+	/* Case 1: group starts before the first_node in tree */
+	if (cur_node == NULL){
+		first_node = rb_first(&tree->frsp_t_root);
+		first = rb_entry(first_node, struct ext4_freespace_node, node);
+		temp = end <= first->offset? end : first->offset;
+		for (; i < temp; i++){
+			mb_set_bit(i-start, bitmap);
+		}
+		cur = first;
+		printk(KERN_ERR "before first");
+	}
+	else{
+		cur = rb_entry(cur_node, struct ext4_freespace_node, node); 
+	}
+
+	/* Case 2: group starts after cur node */
+	if (cur->offset + EXT4_C2B(sbi, cur->length) < start) {
+		next_node = rb_next(cur_node);
+		next = rb_entry(next_node, struct ext4_freespace_node, node);
+		temp = end <= next->offset? end : next->offset;
+		for (; i < temp; i++){
+			mb_set_bit(i-start, bitmap);
+		}
+		cur = next;
+	}
+
+	/* Case 3: group starts inside cur node */
+	else{
+		/* do nothing */
+	}
+
+	if (cur){
+		while (cur->offset < end) {
+			cur_node = &cur->node;
+			node_end = cur->offset + EXT4_C2B(sbi, cur->length);
+			if (node_end > end) 
+				node_end = end;
+			
+			/* spaces between last 0 to cur: mark as 1 (allocated) */
+			for (; i < cur->offset; i++){
+				mb_set_bit(i-start, bitmap);
+			}
+
+			/* spaces in current tree node: mark as 0 (free) */
+			for (; i < node_end; i++) {
+				mb_clear_bit(i-start, bitmap);
+			}
+
+			cur_node = rb_next(&cur->node);
+			if (cur_node)
+				cur = rb_entry(cur_node, struct ext4_freespace_node, node);
+			else {
+				break;
+			}	
+		}
+	}
+	/* spaces outside last tree node: mark as 1 (allocated) */
+	for (; i < end; i++){
+		mb_set_bit(i-start, bitmap);
+	}
+	return err;
+}
+
 
 int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group, 
 			  struct buffer_head *bh)
@@ -2440,7 +2561,7 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 	
 
 	/* find all unused blocks in bitmap, convert them to new tree node */
-	while(bit < end) {
+	while(bit < end) { /* TODO: check edge case */
 		bit = mb_find_next_zero_bit(bh->b_data, end, bit);
 		if (bit >= end)
 			break;	
@@ -2454,11 +2575,10 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		new_entry->offset = offset;
 		new_entry->length = EXT4_NUM_B2C(sbi, length);
 		new_node = &new_entry->node;
-		printk(KERN_DEBUG "new_entry:\noffset:%d\nlength:%d\n\n", new_entry->offset, new_entry->length);
+		printk(KERN_DEBUG "[new_entry] offset:%d  length:%d\n", new_entry->offset, new_entry->length);
 
 		/* insert to tree */
 		spin_lock(&tree->frsp_t_lock);
-		printk(KERN_DEBUG "tree address: %px", tree);
 		err = ext4_mb_freespace_node_insert(&tree->frsp_t_root, new_entry);
 		spin_unlock(&tree->frsp_t_lock);
 		if (err) {
@@ -2479,7 +2599,7 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 				new_entry->length += prev_entry->length;
 				rb_erase(prev, &tree->frsp_t_root);
 				kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
-				printk(KERN_DEBUG "merged entry starting at %d, total length = %d", new_entry->offset, new_entry->length);
+				printk(KERN_DEBUG "merged entry starting at %d, total length = %d\n", new_entry->offset, new_entry->length);
 			}
 		}
 		spin_unlock(&tree->frsp_t_lock);
@@ -2494,7 +2614,7 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 				new_entry->length += next_entry->length;
 				rb_erase(right, &tree->frsp_t_root);
 				kmem_cache_free(ext4_freespace_node_cachep, next_entry);
-				printk(KERN_DEBUG "merged entry starting at %d, total length = %d", new_entry->offset, new_entry->length);
+				printk(KERN_DEBUG "merged entry starting at %d, total length = %d\n", new_entry->offset, new_entry->length);
 			}
 		}
 		spin_unlock(&tree->frsp_t_lock);
@@ -2580,6 +2700,12 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 		if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
 			int err;
 			err = ext4_mb_load_freespace_trees(sb, group, bh);
+			void *temp = kzalloc(sb->s_blocksize, GFP_KERNEL);
+			ext4_mb_update_group_bitmap(sb, group, temp);
+			int cmp = memcmp(temp, meta_group_info[i]->bb_bitmap, sb->s_blocksize);
+			printk(KERN_ERR "--------- Comparison result = %d ----------\n\n", cmp);
+			kfree(temp);
+
 			if (err){
 				put_bh(bh);
 				goto exit_freespace_tree;

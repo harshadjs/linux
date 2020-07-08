@@ -82,7 +82,7 @@ do {									\
  * Struct for tree node in freespace_tree
  */
 struct ext4_freespace_node {
-	unsigned int offset; /* Start block offset w.r.t. current flexible group*/
+	ext4_fsblk_t offset; /* Start block offset w.r.t. current flexible group*/
 	unsigned int length; /* Length of free spaces in number of clusters*/
 	struct rb_node node; 
 };

@@ -2590,14 +2590,14 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		/* try merge to left and right */
 		/* left */
 		spin_lock(&tree->frsp_t_lock); 
-		struct rb_node *prev = rb_prev(new_node);
-		if (prev){
-			struct ext4_freespace_node *prev_entry = rb_entry(prev, struct ext4_freespace_node, node);
+		struct rb_node *left = rb_prev(new_node);
+		if (left){
+			struct ext4_freespace_node *prev_entry = rb_entry(left, struct ext4_freespace_node, node);
 			if (ext4_mb_freespace_node_can_merge(sb, prev_entry, new_entry)) {
 				printk(KERN_DEBUG "Merge to left: %d %d\n", prev_entry->offset, new_entry->offset);
 				new_entry->offset = prev_entry->offset;
 				new_entry->length += prev_entry->length;
-				rb_erase(prev, &tree->frsp_t_root);
+				rb_erase(left, &tree->frsp_t_root);
 				kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
 				printk(KERN_DEBUG "merged entry starting at %d, total length = %d\n", new_entry->offset, new_entry->length);
 			}
@@ -2882,7 +2882,7 @@ int ext4_mb_init(struct super_block *sb)
 	unsigned i, j;
 	unsigned offset, offset_incr;
 	unsigned max;
-	int ret;
+	int ret = 0;
 
 	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_offsets);
 
@@ -2922,9 +2922,8 @@ int ext4_mb_init(struct super_block *sb)
 
 	/* init for freespace trees */
 	if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
-		int err;
-		err = ext4_mb_init_freespace_trees(sb);
-		if(err){
+		ret = ext4_mb_init_freespace_trees(sb);
+		if(ret){
 			goto out;
 		}
 	}
@@ -2995,8 +2994,10 @@ out:
 	sbi->s_mb_offsets = NULL;
 	kfree(sbi->s_mb_maxs);
 	sbi->s_mb_maxs = NULL;
-	kfree(sbi->s_mb_freespace_trees);
-	sbi->s_mb_freespace_trees = NULL;
+	if (test_opt2(sb, FREESPACE_TREE)){
+		kfree(sbi->s_mb_freespace_trees);
+		sbi->s_mb_freespace_trees = NULL;
+	}
 	return ret;
 }
 

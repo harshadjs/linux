@@ -82,9 +82,9 @@ do {									\
  * Struct for tree node in freespace_tree
  */
 struct ext4_freespace_node {
-	unsigned int offset; /* Start block offset w.r.t. current flexible group*/
-	unsigned int length; /* Length of free spaces in number of clusters*/
-	struct rb_node node; 
+	unsigned int frsp_offset; /* Start block offset w.r.t. current flexible group*/
+	unsigned int frsp_length; /* Length of free spaces in number of clusters*/
+	struct rb_node frsp_node; 
 };
 
 
@@ -155,6 +155,12 @@ struct ext4_locality_group {
 	spinlock_t		lg_prealloc_lock;
 };
 
+struct ext4_tree_extent {
+	unsigned int te_idx;	 /* flex_bg index (tree index) */
+	unsigned int te_offset;  /* block offset w.r.t tree */
+	unsigned int te_len;	 /* length */
+};
+
 struct ext4_allocation_context {
 	struct inode *ac_inode;
 	struct super_block *ac_sb;
@@ -170,6 +176,9 @@ struct ext4_allocation_context {
 
 	/* copy of the best found extent taken before preallocation efforts */
 	struct ext4_free_extent ac_f_ex;
+
+	/* the best found tree node */
+	struct ext4_tree_extent ac_b_tree_ex;
 
 	__u16 ac_groups_scanned;
 	__u16 ac_found;

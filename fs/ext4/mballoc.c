@@ -25,6 +25,10 @@ module_param_named(mballoc_debug, ext4_mballoc_debug, ushort, 0644);
 MODULE_PARM_DESC(mballoc_debug, "Debugging level for ext4's mballoc");
 #endif
 
+/* disable print statements */
+#define printk(...)
+
+
 /*
  * MUSTDO:
  *   - test ext4_ext_search_left() and ext4_ext_search_right()
@@ -339,6 +343,7 @@ MODULE_PARM_DESC(mballoc_debug, "Debugging level for ext4's mballoc");
 static struct kmem_cache *ext4_pspace_cachep;
 static struct kmem_cache *ext4_ac_cachep;
 static struct kmem_cache *ext4_free_data_cachep;
+static struct kmem_cache *ext4_freespace_node_cachep;
 
 /* We create slab caches for groupinfo data structures based on the
  * superblock block size.  There will be one per mounted filesystem for
@@ -370,6 +375,19 @@ static inline void *mb_correct_addr_and_bit(int *bit, void *addr)
 #endif
 	return addr;
 }
+
+static inline unsigned int ext4_blkno_to_flex_offset(struct super_block *sb, ext4_fsblk_t blkno)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	return blkno % (ext4_flex_bg_size(sbi)*sbi->s_blocks_per_group);
+}
+
+static inline ext4_fsblk_t ext4_flex_offset_to_blkno(struct super_block *sb, unsigned int i, unsigned int flex_offset)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	return i*ext4_flex_bg_size(sbi)*sbi->s_blocks_per_group + flex_offset;
+}
+
 
 static inline int mb_test_bit(int bit, void *addr)
 {
@@ -2393,17 +2411,336 @@ int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
 	return 0;
 }
 
+/* insert to offset-indexed tree */
+int ext4_mb_freespace_node_insert(struct rb_root *root, struct ext4_freespace_node *new_entry)
+{
+	struct rb_node **new = &(root->rb_node), *parent = NULL;
+	while(*new) {
+		struct ext4_freespace_node *this = rb_entry(*new, struct ext4_freespace_node, frsp_node);
+		parent = *new;
+
+		if (new_entry->frsp_offset < this->frsp_offset)
+			new = &((*new)->rb_left);
+		else if (new_entry->frsp_offset > this->frsp_offset)
+			new = &((*new)->rb_right);
+		else{
+			printk(KERN_ERR "Already have node at %u", this->frsp_offset);
+			return 1;
+		}
+	}
+	rb_link_node(&new_entry->frsp_node, parent, new);
+	rb_insert_color(&new_entry->frsp_node, root);
+	return 0;
+
+}
+
+
+/* 
+ * check if two entries in freespace tree can be merged together 
+ */
+int ext4_mb_freespace_node_can_merge(struct super_block *sb, struct ext4_freespace_node* prev_entry, struct ext4_freespace_node *cur_entry)
+{
+	return (prev_entry->frsp_offset + prev_entry->frsp_length == cur_entry->frsp_offset);
+}
+
+/* 
+ * Right fuzzy-search for freespace tree:
+ * 
+ * return the embeded rb_node of the freespace_node containing target offset
+ * return NEXT rb_node if not found in tree && tree is not empty && NEXT is not NULL;
+ * return NULL if tree is empty || target node exists after the last node
+ */
+struct rb_node *ext4_mb_r_search_freespace_trees(struct super_block *sb, 
+				struct rb_root *root, unsigned int target)
+{
+	struct rb_node *node = root->rb_node;
+	struct rb_node *last = rb_last(root);
+	struct rb_node *right = NULL;
+	struct ext4_freespace_node *last_node, *this;
+	
+	/* empty tree */
+	if (!last)
+		return NULL;
+
+	last_node = rb_entry(last, struct ext4_freespace_node, frsp_node);
+
+	/* target > rb_last */
+	if (target > (last_node->frsp_offset + last_node->frsp_length))
+		return right;
+
+	while(node){
+		this = rb_entry(node, struct ext4_freespace_node, frsp_node);
+		if ((this->frsp_offset <= target) && (target < this->frsp_offset + this->frsp_length)){
+			right = node;
+			break;
+		}
+		else if (target < this->frsp_offset){
+			right = node;
+			node = node->rb_left;
+		}
+		else {
+			node = node->rb_right;
+		}
+	}
+	return right;
+}
+
+/* 
+ * Exact search for freespace tree
+ * return embedded rb_node of the target freespace_node if found
+ * return NULL if not found || empty tree
+ */
+struct rb_node *ext4_mb_search_freespace_trees(struct super_block *sb, 
+				struct rb_root *root, unsigned int target)
+{
+	struct rb_node *node = root->rb_node;
+	struct ext4_freespace_node *this = NULL;
+	
+	while(node){
+		this = rb_entry(node, struct ext4_freespace_node, frsp_node);
+		if (this->frsp_offset == target){
+			return node;
+		}
+		else if (target < this->frsp_offset)
+			node = node->rb_left;
+		else {
+			node = node->rb_right;
+		}
+	}
+	return node;
+}
+
+/* Left fuzzy-search for freespace tree
+ * return the embedded rb_node of the freespace node containing target offset
+ * return PREV node if no target node exists in tree && tree is not empty
+ * return NULL if tree is empty || target node exists before the first node
+ */
+struct rb_node *ext4_mb_l_search_freespace_trees(struct super_block *sb, 
+				struct rb_root *root, unsigned int target)
+{
+	struct rb_node *node = root->rb_node;
+	struct rb_node *first = rb_first(root);
+	struct rb_node *left = NULL;
+	struct ext4_freespace_node *first_node, *this;
+	
+	/* empty tree */
+	if (!first)
+		return NULL;
+
+	first_node = rb_entry(first, struct ext4_freespace_node, frsp_node);
+
+	/* target < rb_first */
+	if (target < first_node->frsp_offset)
+		return left;
+
+	while(node){
+		this = rb_entry(node, struct ext4_freespace_node, frsp_node);
+		if ((this->frsp_offset <= target) && (target < this->frsp_offset + this->frsp_length)){
+			left = node;
+			break;
+		}
+		else if (target < this->frsp_offset)
+			node = node->rb_left;
+		else {
+			left = node;
+			node = node->rb_right;
+		}
+	}
+	return left;
+}
+
+
+/* 
+ * Group-level freespace_tree --> bitmap conversion
+ * 
+ * Given a group and a bitmap address, 
+ * update the content of this group bitmap 
+ * based on latest freespace_tree.
+ */
+int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void *bitmap)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int ret = 0, i = 0;
+	ext4_fsblk_t blk_no;
+	unsigned int node_end, start, end;
+	unsigned int flex_idx = group >> sbi->s_es->s_log_groups_per_flex, groups_per_flex = 1 << sbi->s_es->s_log_groups_per_flex;
+	struct ext4_freespace_node *cur = NULL, *next = NULL;
+	struct rb_node *cur_node = NULL, *first_node = NULL, *next_node = NULL;
+	struct ext4_freespace_root *tree = &(sbi->s_mb_freespace_trees[flex_idx]);
+
+	/* offset of group */
+	blk_no = ext4_group_first_block_no(sb, group);
+	start = blk_no % (groups_per_flex*sbi->s_blocks_per_group);
+	end = start + sbi->s_blocks_per_group;
+	i = i + start;
+
+	/* get the starting tree node to traverse from */
+	cur_node = ext4_mb_l_search_freespace_trees(sb, &tree->frsp_t_root, i);		
+	
+	/* Case 0: empty tree */
+	first_node = rb_first(&tree->frsp_t_root);
+	if (!first_node) {
+		printk(KERN_ERR "**Empty tree");
+		for (; i < end; i++) {
+			mb_set_bit(i-start, bitmap);
+		}
+		return ret;
+	}
+
+	/* Case 1: group starts before the first_node in tree */
+	if (cur_node == NULL){
+		printk(KERN_ERR "**Before First");
+		cur = rb_entry(first_node, struct ext4_freespace_node, frsp_node);
+	}
+	else{
+		cur = rb_entry(cur_node, struct ext4_freespace_node, frsp_node); 
+	}
+
+	/* Case 2: group starts after cur node */
+	if (cur->frsp_offset + cur->frsp_length < start) {
+		next_node = rb_next(cur_node);
+		if (!next_node){
+			for (; i < end; i++) {
+				mb_set_bit(i-start, bitmap);
+			}
+			return ret;
+		}
+		next = rb_entry(next_node, struct ext4_freespace_node, frsp_node);
+		cur = next;
+	}
+
+	/* Case 3: group starts inside cur node */
+	else{
+		/* do nothing */
+	}
+
+	if (cur){
+		while (cur->frsp_offset < end) {
+			cur_node = &cur->frsp_node;
+			node_end = cur->frsp_offset + cur->frsp_length;
+			if (node_end > end) 
+				node_end = end;
+			
+			/* spaces between last 0 to cur: mark as 1 (allocated) */
+			for (; i < cur->frsp_offset; i++){
+				mb_set_bit(i-start, bitmap);
+			}
+
+			/* spaces in current tree node: mark as 0 (free) */	
+			mb_clear_bits(bitmap, i-start, node_end-i);
+			i = node_end;
+
+			cur_node = rb_next(&cur->frsp_node);
+			if (cur_node)
+				cur = rb_entry(cur_node, struct ext4_freespace_node, frsp_node);
+			else {
+				break;
+			}	
+		}
+	}
+	/* spaces outside last tree node: mark as 1 (allocated) */
+	for (; i < end; i++){
+		mb_set_bit(i-start, bitmap);
+	}
+	return ret;
+}
+
+
+/*
+ * Load freespace_tree from on-disk bitmaps
+ * 
+ * FIXME: now this function assumes DOUBLE_CHECK flag is turned on, 
+ * 		  and reads in-memory bitmaps contained in ext4_group_info
+ * 
+ */
+int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group, 
+			  struct buffer_head *bh)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int err = 0;
+	ext4_fsblk_t blk_no;
+	unsigned int length = 0, offset = 0, bit = 0, next;
+	unsigned int  end = sbi->s_blocks_per_group, groups_per_flex = 1 << sbi->s_es->s_log_groups_per_flex;
+	unsigned int flex_idx = group >> sbi->s_es->s_log_groups_per_flex;
+	struct ext4_freespace_root *tree = &(sbi->s_mb_freespace_trees[flex_idx]);
+	struct ext4_freespace_node *new_entry = NULL, *next_entry = NULL, *prev_entry = NULL;
+	struct rb_node *new_node = NULL, *left = NULL, *right = NULL;
+	
+	printk(KERN_ERR "Tree #%u: %px", flex_idx, tree);
+	printk(KERN_ERR "Group #%u", group);
+	
+	mutex_lock(&tree->frsp_t_lock);
+	/* TODO: move kmem_free outside spin_lock */
+	/* find all unused blocks in bitmap, convert them to new tree node */
+	while(bit < end) { /* TODO: check edge case */
+		bit = mb_find_next_zero_bit(bh->b_data, end, bit);
+		if (bit >= end)
+			break;	
+		next = mb_find_next_bit(bh->b_data, end, bit);
+		length = next - bit; 
+		blk_no = (ext4_group_first_block_no(sb, group) + bit);
+		printk(KERN_ERR "Block #%lld", blk_no);
+		offset =  blk_no % (groups_per_flex*sbi->s_blocks_per_group);
+		
+		/* create new tree node */
+		new_entry = kmem_cache_alloc(ext4_freespace_node_cachep, GFP_NOFS);
+		new_entry->frsp_offset = EXT4_NUM_B2C(sbi, offset);
+		new_entry->frsp_length = EXT4_NUM_B2C(sbi, length);
+		new_node = &new_entry->frsp_node;
+		printk(KERN_ERR "[new_entry] offset:%u  length:%u\n", new_entry->frsp_offset, new_entry->frsp_length);
+
+		/* insert to tree */
+		err = ext4_mb_freespace_node_insert(&tree->frsp_t_root, new_entry);
+		if (err) {
+			printk(KERN_ERR "Group %u: Failed to insert node containing freeblocks starting at %u into Tree %u\n", 
+						group, offset, flex_idx);
+			return err;
+		}
+
+		/* try merge to left and right */
+		/* left */
+		left = rb_prev(new_node);
+		if (left){
+			prev_entry = rb_entry(left, struct ext4_freespace_node, frsp_node);
+			if (ext4_mb_freespace_node_can_merge(sb, prev_entry, new_entry)) {
+				printk(KERN_ERR "Merge to left: %u %u\n", prev_entry->frsp_offset, new_entry->frsp_offset);
+				new_entry->frsp_offset = prev_entry->frsp_offset;
+				new_entry->frsp_length += prev_entry->frsp_length;
+				rb_erase(left, &tree->frsp_t_root);
+				kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
+				printk(KERN_ERR "merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);
+			}
+		}
+
+		/* right */
+		right = rb_next(new_node);
+		if (right){
+			next_entry = rb_entry(right, struct ext4_freespace_node, frsp_node);
+			if (ext4_mb_freespace_node_can_merge(sb, new_entry, next_entry)) {
+				printk(KERN_ERR "Merge to right: %u %u\n", new_entry->frsp_offset, next_entry->frsp_offset);
+				new_entry->frsp_length += next_entry->frsp_length;
+				rb_erase(right, &tree->frsp_t_root);
+				kmem_cache_free(ext4_freespace_node_cachep, next_entry);
+				printk(KERN_ERR "merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);
+			}
+		}
+		bit = next + 1;
+	}
+	mutex_unlock(&tree->frsp_t_lock);
+
+	return err;
+}
+
 /* Create and initialize ext4_group_info data for the given group. */
 int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 			  struct ext4_group_desc *desc)
 {
-	int i;
+	int i, err;
 	int metalen = 0;
 	int idx = group >> EXT4_DESC_PER_BLOCK_BITS(sb);
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_group_info **meta_group_info;
 	struct kmem_cache *cachep = get_groupinfo_cache(sb->s_blocksize_bits);
-
 	/*
 	 * First check if this group is the first of a reserved block.
 	 * If it's true, we have to allocate a new table of pointers
@@ -2462,6 +2799,23 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 		BUG_ON(IS_ERR_OR_NULL(bh));
 		memcpy(meta_group_info[i]->bb_bitmap, bh->b_data,
 			sb->s_blocksize);
+
+		/* map contents of bitmap into freespace trees*/
+		if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+			err = ext4_mb_load_freespace_trees(sb, group, bh);
+			/*
+			temp = kzalloc(sb->s_blocksize, GFP_KERNEL);
+			ext4_mb_update_group_bitmap(sb, group, temp);
+			cmp = memcmp(temp, meta_group_info[i]->bb_bitmap, sb->s_blocksize);
+			printk(KERN_ERR "--------- Comparison result = %d ----------\n\n", cmp);
+			kfree(temp);
+
+			if (err){
+				put_bh(bh);
+				goto exit_freespace_tree;
+			}
+			*/
+		}
 		put_bh(bh);
 	}
 #endif
@@ -2481,7 +2835,11 @@ exit_group_info:
 	}
 exit_meta_group_info:
 	return -ENOMEM;
+exit_freespace_tree:
+	/* TODO: release what has been allocated in ext4_mb_load_frerespace_trees*/
+	return -ENOMEM;
 } /* ext4_mb_add_groupinfo */
+
 
 static int ext4_mb_init_backend(struct super_block *sb)
 {
@@ -2588,13 +2946,42 @@ static int ext4_groupinfo_create_slab(size_t size)
 	return 0;
 }
 
+/*
+ * Initialize sbi->ext4_freespace_root
+ */
+int ext4_mb_init_freespace_trees(struct super_block *sb)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	ext4_group_t groups_count, groups_per_flex;
+	size_t flex_bg_count;
+	int ret = 0;
+	unsigned i, j;
+
+	groups_count = ext4_get_groups_count(sb);
+	groups_per_flex = 1 << sbi->s_es->s_log_groups_per_flex;
+	flex_bg_count = (groups_count + groups_per_flex - 1) >> (sbi->s_es->s_log_groups_per_flex);
+	i = flex_bg_count * sizeof(struct ext4_freespace_root);
+
+	sbi->s_mb_freespace_trees = (struct ext4_freespace_root *)kzalloc(i, GFP_KERNEL);
+	if (sbi->s_mb_freespace_trees == NULL){
+		return-ENOMEM;
+	}
+
+	for (j = 0; j < flex_bg_count; j++){
+		sbi->s_mb_freespace_trees[j].frsp_t_root = RB_ROOT;
+		mutex_init(&(sbi->s_mb_freespace_trees[j].frsp_t_lock));
+	}
+
+	return ret;
+}
+
 int ext4_mb_init(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	unsigned i, j;
 	unsigned offset, offset_incr;
 	unsigned max;
-	int ret;
+	int ret = 0;
 
 	i = (sb->s_blocksize_bits + 2) * sizeof(*sbi->s_mb_offsets);
 
@@ -2631,6 +3018,14 @@ int ext4_mb_init(struct super_block *sb)
 		max = max >> 1;
 		i++;
 	} while (i <= sb->s_blocksize_bits + 1);
+
+	/* init for freespace trees */
+	if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+		ret = ext4_mb_init_freespace_trees(sb);
+		if(ret){
+			goto out;
+		}
+	}
 
 	spin_lock_init(&sbi->s_md_lock);
 	spin_lock_init(&sbi->s_bal_lock);
@@ -2698,6 +3093,10 @@ out:
 	sbi->s_mb_offsets = NULL;
 	kfree(sbi->s_mb_maxs);
 	sbi->s_mb_maxs = NULL;
+	if (test_opt2(sb, FREESPACE_TREE)){
+		kfree(sbi->s_mb_freespace_trees);
+		sbi->s_mb_freespace_trees = NULL;
+	}
 	return ret;
 }
 
@@ -2925,6 +3324,15 @@ int __init ext4_init_mballoc(void)
 		kmem_cache_destroy(ext4_ac_cachep);
 		return -ENOMEM;
 	}
+
+	ext4_freespace_node_cachep = KMEM_CACHE(ext4_freespace_node,
+						SLAB_RECLAIM_ACCOUNT);
+	if (ext4_freespace_node_cachep == NULL) {
+		kmem_cache_destroy(ext4_pspace_cachep);
+		kmem_cache_destroy(ext4_ac_cachep);
+		kmem_cache_destroy(ext4_free_data_cachep);
+		return -ENOMEM;
+	}
 	return 0;
 }
 
@@ -2938,6 +3346,7 @@ void ext4_exit_mballoc(void)
 	kmem_cache_destroy(ext4_pspace_cachep);
 	kmem_cache_destroy(ext4_ac_cachep);
 	kmem_cache_destroy(ext4_free_data_cachep);
+	kmem_cache_destroy(ext4_freespace_node_cachep);
 	ext4_groupinfo_destroy_slabs();
 }
 
@@ -4278,6 +4687,12 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	ac->ac_g_ex = ac->ac_o_ex;
 	ac->ac_flags = ar->flags;
 
+	/* set up best-found tree node */
+	ac->ac_b_tree_ex.te_offset = 0;
+	ac->ac_b_tree_ex.te_idx = 0;
+	ac->ac_b_tree_ex.te_len = 0;
+	
+
 	/* we have to define context: we'll we work with a file or
 	 * locality group. this is a policy, actually */
 	ext4_mb_group_or_file(ac);
@@ -4487,6 +4902,361 @@ static int ext4_mb_discard_preallocations(struct super_block *sb, int needed)
 }
 
 /*
+ * check if we have scanned sufficient freespace candidates
+ * stop scanning if reached/exceeded s_max_to_scan 
+ * 
+ * TODO: may handle more allocation HINTS in this function
+ */
+static void ext4_mb_freespace_check_limits(struct ext4_allocation_context *ac)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	struct ext4_tree_extent *btx = &ac->ac_b_tree_ex;
+
+	if (ac->ac_status == AC_STATUS_FOUND)
+		return;
+
+	/*
+	 * Exceeded max number of nodes to scan
+	 */
+	if (ac->ac_found > sbi->s_mb_max_to_scan &&
+			!(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		ac->ac_status = AC_STATUS_BREAK;
+		return;
+	}
+
+	/*
+  	 * Haven't satisfied request
+  	 */
+	if (btx->te_len < ac->ac_g_ex.fe_len)
+		return;
+
+	return;
+}
+
+/*
+ * Mark spaces in selected tree node as used
+ * Then update the tree
+ * 
+ * Must call with lock
+ */
+static void ext4_mb_freespace_use_best_found(struct ext4_allocation_context *ac,
+					 unsigned int i, struct ext4_freespace_node *selected)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	struct ext4_freespace_root *tree = &sbi->s_mb_freespace_trees[i];
+	struct ext4_tree_extent *btx = &ac->ac_b_tree_ex;
+
+	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
+	btx->te_len = min(btx->te_len, (unsigned int)ac->ac_g_ex.fe_len);
+	ac->ac_status = AC_STATUS_FOUND;
+
+	/* used ALL spaces in this tree node: remove node */
+	if (btx->te_len == selected->frsp_length) {
+		printk(KERN_ERR"ALLOCATE: used ALL: %u %u len=%u", btx->te_idx, btx->te_offset, btx->te_len);
+		rb_erase(&selected->frsp_node, &tree->frsp_t_root);
+		kmem_cache_free(ext4_freespace_node_cachep, selected);
+	}
+
+	/* used only a part: update node */
+	else if(btx->te_len < selected->frsp_length) {
+		/*printk(KERN_ERR"ALLOCATE: used PARTIAL: %u %u len=%u", btx->te_idx, btx->te_offset, btx->te_len);*/
+		selected->frsp_offset += btx->te_len;
+		selected->frsp_length -= btx->te_len;
+		/*printk(KERN_ERR"ALLOCATE: updated Entry: start=%u, length=%u", selected->frsp_offset, selected->frsp_length);*/
+	}
+
+	return;
+}
+
+
+/*
+ * The routine checks whether found tree node is good enough. If it is,
+ * then the tree node gets marked used and flag is set to the context
+ * to stop scanning. 
+ * 
+ * Otherwise, the tree node is compared with the
+ * previous found extent and if new one is better, then it's stored
+ * in the context. 
+ * 
+ * Later, the best found tree node will be used, if
+ * mballoc can't find good enough extent.
+ *
+ * FIXME: real allocation policy is to be designed yet!
+ */
+static void ext4_mb_measure_node(struct ext4_allocation_context *ac,
+					 unsigned int i, struct ext4_freespace_node *cur)
+{
+	struct ext4_tree_extent *btx = &ac->ac_b_tree_ex;
+	struct ext4_free_extent *gex = &ac->ac_g_ex;
+
+	BUG_ON(btx->te_len < 0);
+	BUG_ON(ac->ac_status != AC_STATUS_CONTINUE);
+
+	ac->ac_found++;
+
+	/*
+	 * The special case - take what you catch first
+	 */
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
+		btx->te_idx = i;
+		btx->te_offset = cur->frsp_offset;
+		btx->te_len = cur->frsp_length;
+		ext4_mb_freespace_use_best_found(ac, i, cur);
+		return;
+	}
+
+	/*
+	 * Exact Match
+	 */
+	if (cur->frsp_length == gex->fe_len) {
+		btx->te_idx = i;
+		btx->te_offset = cur->frsp_offset;
+		btx->te_len = cur->frsp_length;
+		ext4_mb_freespace_use_best_found(ac, i, cur);
+		return;
+	}
+
+	/*
+	 * If this is first found extent, just store it in the context
+	 */
+	if (btx->te_len == 0) {
+		btx->te_idx = i;
+		btx->te_offset = cur->frsp_offset;
+		btx->te_len = cur->frsp_length;
+		return;
+	}
+
+	/*
+	 * If new found tree node is better, store it in the context
+	 */
+	if (btx->te_len < gex->fe_len) {
+		/* Request isn't satisfied, 
+		 * take the larger tree node */
+		if (cur->frsp_length > btx->te_len){
+			btx->te_idx = i;
+			btx->te_offset = cur->frsp_offset;
+			btx->te_len = cur->frsp_length;
+		}
+
+
+	} else if (cur->frsp_length > gex->fe_len) {
+		/* Request is satisfied, then we try to find
+		 * take the tree node that still satisfy the request, but smaller */
+		if (cur->frsp_length < btx->te_len){
+			btx->te_idx = i;
+			btx->te_offset = cur->frsp_offset;
+			btx->te_len = cur->frsp_length;
+		}
+	}
+
+	ext4_mb_freespace_check_limits(ac);
+}
+
+/* Looks for freespace in the flex_bg containing goal group */
+static noinline_for_stack
+int ext4_mb_freespace_find_by_goal(struct ext4_allocation_context *ac, unsigned int i)
+{
+	unsigned int tree_goal;
+	int ret = 0;
+	ext4_fsblk_t blk; 
+	ext4_group_t group = ac->ac_g_ex.fe_group;
+	struct rb_node *node = NULL;
+	struct ext4_freespace_root *tree = NULL;
+	struct ext4_freespace_node *cur = NULL;
+	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+
+	if (!(ac->ac_flags & EXT4_MB_HINT_TRY_GOAL))
+		return ret;
+	
+	/* compute start node offset in tree */
+	blk = ext4_group_first_block_no(ac->ac_sb, group) + ac->ac_g_ex.fe_start;
+	tree_goal = blk % (sbi->s_blocks_per_group << sbi->s_log_groups_per_flex);
+
+	/* access tree */	
+	tree = &(sbi->s_mb_freespace_trees[i]);
+
+	/* try goal block and its freespace_tree first */
+	mutex_lock(&tree->frsp_t_lock);
+	node = ext4_mb_r_search_freespace_trees(ac->ac_sb, &tree->frsp_t_root, tree_goal);
+	while (node && ac->ac_status==AC_STATUS_CONTINUE) {
+		cur = rb_entry(node, struct ext4_freespace_node, frsp_node);
+		ext4_mb_measure_node(ac, i, cur);
+		ext4_mb_freespace_check_limits(ac);
+		node = rb_next(node);
+	}
+	mutex_unlock(&tree->frsp_t_lock);
+
+	return ret;
+}
+
+/* allocator for freespace_tree */
+static noinline_for_stack int
+ext4_mb_tree_allocator(struct ext4_allocation_context *ac)
+{  
+	struct ext4_sb_info *sbi;
+	struct super_block *sb;
+	unsigned int flex_bg_count, ntrees, i, j;
+	ext4_group_t ngroups, group;
+	struct ext4_freespace_root *tree = NULL;
+	struct rb_node *node = NULL;
+	struct ext4_freespace_node *cur = NULL;
+	struct ext4_tree_extent *btx = NULL;
+	int ret = 0;
+
+	sb = ac->ac_sb;
+	btx = &ac->ac_b_tree_ex;
+	sbi = EXT4_SB(sb);
+
+	ngroups = ext4_get_groups_count(ac->ac_sb);
+	group = ac->ac_g_ex.fe_group;
+	flex_bg_count = (ngroups + ext4_flex_bg_size(sbi) - 1) >> (sbi->s_es->s_log_groups_per_flex);
+	i = group >> sbi->s_log_groups_per_flex; 
+
+	/* First try searching from goal blk in i-th freespace tree */
+	ret = ext4_mb_freespace_find_by_goal(ac, i);
+
+	if(ret || ac->ac_status == AC_STATUS_FOUND)
+		goto out;
+
+	if (unlikely(ac->ac_flags & EXT4_MB_HINT_GOAL_ONLY))
+		goto out;
+
+repeat:
+	ntrees = flex_bg_count;
+
+	/* Loop through the rest of trees (flex_bg) */
+	for (j = 0; (j < ntrees) && ac->ac_status == AC_STATUS_CONTINUE; j++) {
+		tree = &(sbi->s_mb_freespace_trees[(i+j) % ntrees]);
+		mutex_lock(&tree->frsp_t_lock);
+		node = rb_first(&tree->frsp_t_root);
+		while (node && ac->ac_status==AC_STATUS_CONTINUE) {
+			cur = rb_entry(node, struct ext4_freespace_node, frsp_node);
+			ext4_mb_measure_node(ac, i, cur);
+			ext4_mb_freespace_check_limits(ac);
+			node = rb_next(node);
+		}
+		mutex_unlock(&tree->frsp_t_lock);
+	}
+
+	/* Searched long enough. Try use best found so far */
+	if (btx->te_len > 0 && ac->ac_status != AC_STATUS_FOUND 
+		&& !(ac->ac_flags & EXT4_MB_HINT_FIRST)){
+		tree = &sbi->s_mb_freespace_trees[btx->te_idx];
+		mutex_lock(&tree->frsp_t_lock);
+		node = ext4_mb_search_freespace_trees(sb, &tree->frsp_t_root, btx->te_offset);
+		
+
+		if (node){
+			cur = rb_entry(node, struct ext4_freespace_node, frsp_node);
+			ext4_mb_freespace_use_best_found(ac, btx->te_idx, cur);
+			mutex_unlock(&tree->frsp_t_lock);
+		}else{
+			/* Someone else take this freespace node before us
+			 * Reset best-found tree extent, and turn on FIRST HINT (greedy)
+			 */
+			mutex_unlock(&tree->frsp_t_lock);
+			ac->ac_b_tree_ex.te_offset = 0;
+			ac->ac_b_tree_ex.te_idx = 0;
+			ac->ac_b_tree_ex.te_len = 0;
+			ac->ac_status = AC_STATUS_CONTINUE;
+			ac->ac_flags |= EXT4_MB_HINT_FIRST;
+			goto repeat;
+		}
+	}
+
+	/* TODO: handle no space situation */
+	if (btx->te_len == 0){
+		ret = -ENOSPC;
+		goto out;
+	}
+
+out:
+	return ret;
+}
+
+/*
+ * Basic block allocation routine using freespace_tree:
+ * 			- preallocation turned off
+ * 			- normalization turned off
+ * 			- no pruning when searching the trees
+ * 			- no stats monitoring --> no fallback to buddy-bitmap
+ */
+ext4_fsblk_t ext4_mb_freespace_tree_new_blocks(handle_t *handle,
+				struct ext4_allocation_request *ar, int *errp)
+{
+	struct ext4_allocation_context *ac = NULL;
+	struct ext4_sb_info *sbi;
+	struct super_block *sb;
+	struct ext4_tree_extent btx;
+	struct ext4_free_extent *bex;
+	ext4_fsblk_t block = 0;
+	ext4_group_t group_no = 0;
+	unsigned int reserv_clstrs = 0;
+
+	might_sleep();
+	sb = ar->inode->i_sb;
+	sbi = EXT4_SB(sb);
+
+	trace_ext4_request_blocks(ar);
+
+	/* initialize allocation context */
+	ac = kmem_cache_zalloc(ext4_ac_cachep, GFP_NOFS);
+	if (!ac) {
+		ar->len = 0;
+		*errp = -ENOMEM;
+		goto out;
+	}
+
+	*errp = ext4_mb_initialize_context(ac, ar);
+	if (*errp) {
+		ar->len = 0;
+		goto out;
+	}
+
+
+	/* allocate space in core */
+	*errp = ext4_mb_tree_allocator(ac);
+
+	if (*errp){
+		goto errout;
+	}
+
+	if (likely(ac->ac_status == AC_STATUS_FOUND)) {
+
+		/* fill in best_free_extent from tree_extent */
+		btx = ac->ac_b_tree_ex;
+		bex = &ac->ac_b_ex;
+		group_no = (btx.te_idx * ext4_flex_bg_size(sbi)) + (btx.te_offset / sbi->s_blocks_per_group);
+		bex->fe_start = btx.te_offset % sbi->s_blocks_per_group;
+		bex->fe_group = group_no;
+		bex->fe_len = btx.te_len;
+
+		*errp = ext4_mb_mark_diskspace_used(ac, handle, reserv_clstrs);
+		if (*errp) {
+			ext4_discard_allocated_blocks(ac);
+			goto errout;
+		} else {			
+			block = ext4_grp_offs_to_block(sb, &ac->ac_b_ex);
+			ar->len = ac->ac_b_ex.fe_len;
+		}
+	} 
+
+errout:
+	if (*errp) {
+		ac->ac_b_ex.fe_len = 0;
+		ar->len = 0;
+		ext4_mb_show_ac(ac);
+	}
+	ext4_mb_release_context(ac);
+out:
+	if (ac)
+		kmem_cache_free(ext4_ac_cachep, ac);
+	trace_ext4_allocate_blocks(ar, (unsigned long long)block);
+
+	return block;
+}
+
+/*
  * Main entry point into mballoc to allocate blocks
  * it tries to use preallocation first, then falls back
  * to usual allocation
@@ -4505,6 +5275,11 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	might_sleep();
 	sb = ar->inode->i_sb;
 	sbi = EXT4_SB(sb);
+
+	/* use freespace tree allocator */
+	if (test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex){
+		return ext4_mb_freespace_tree_new_blocks(handle, ar, errp);
+	}
 
 	trace_ext4_request_blocks(ar);
 
@@ -4723,6 +5498,68 @@ ext4_mb_free_metadata(handle_t *handle, struct ext4_buddy *e4b,
 	return 0;
 }
 
+int ext4_mb_freespace_free_blocks(struct super_block *sb, ext4_fsblk_t block, 
+								ext4_group_t group, unsigned int length)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	unsigned int i = group >> sbi->s_log_groups_per_flex;
+	struct ext4_freespace_root *tree = &(sbi->s_mb_freespace_trees[i]);
+	struct ext4_freespace_node *new_entry = NULL, *next_entry = NULL, *prev_entry = NULL;
+	struct rb_node *new_node = NULL, *left = NULL, *right = NULL;	
+	unsigned int offset;
+	int err = 0;
+
+	offset = ext4_blkno_to_flex_offset(sb, block);
+	/* create new tree node */
+	new_entry = kmem_cache_alloc(ext4_freespace_node_cachep, GFP_NOFS);
+	new_entry->frsp_offset = EXT4_NUM_B2C(sbi, offset);
+	new_entry->frsp_length = length;
+	new_node = &new_entry->frsp_node;
+	/*printk(KERN_ERR "FREE: [new_entry] offset:%u  length:%u\n", new_entry->frsp_offset, new_entry->frsp_length);*/
+
+	/* insert to tree */
+	err = ext4_mb_freespace_node_insert(&tree->frsp_t_root, new_entry);
+	if (err) {
+		printk(KERN_ERR "Group %u: Failed to FREE and insert node containing freeblocks starting at %u into Tree %u\n", 
+					group, offset, i);
+		return err;
+	}
+
+	/* TODO: should we consider the case when length acrosses tree boundaries? */
+
+	mutex_lock(&tree->frsp_t_lock);
+	/* try merge to left and right */
+	/* left */
+	left = rb_prev(new_node);
+	if (left){
+		prev_entry = rb_entry(left, struct ext4_freespace_node, frsp_node);
+		if (ext4_mb_freespace_node_can_merge(sb, prev_entry, new_entry)) {
+			/*printk(KERN_ERR "FREE: Merge to left: %u %u\n", prev_entry->frsp_offset, new_entry->frsp_offset);*/
+			new_entry->frsp_offset = prev_entry->frsp_offset;
+			new_entry->frsp_length += prev_entry->frsp_length;
+			rb_erase(left, &tree->frsp_t_root);
+			kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
+			/*printk(KERN_ERR "FREE: merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);*/
+		}
+	}
+
+	/* right */
+	right = rb_next(new_node);
+	if (right){
+		next_entry = rb_entry(right, struct ext4_freespace_node, frsp_node);
+		if (ext4_mb_freespace_node_can_merge(sb, new_entry, next_entry)) {
+			/*printk(KERN_ERR "FREE: Merge to right: %u %u\n", new_entry->frsp_offset, next_entry->frsp_offset);*/
+			new_entry->frsp_length += next_entry->frsp_length;
+			rb_erase(right, &tree->frsp_t_root);
+			kmem_cache_free(ext4_freespace_node_cachep, next_entry);
+			/*printk(KERN_ERR "FREE: merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);*/
+		}
+	}
+	mutex_unlock(&tree->frsp_t_lock);
+	
+	return 0;
+}
+
 /**
  * ext4_free_blocks() -- Free given blocks and update quota
  * @handle:		handle for this transaction
@@ -4770,7 +5607,7 @@ void ext4_free_blocks(handle_t *handle, struct inode *inode,
 
 	if (bh && (flags & EXT4_FREE_BLOCKS_FORGET)) {
 		BUG_ON(count > 1);
-
+		/* TODO: ext4_forget: tell journal the block is freed */
 		ext4_forget(handle, flags & EXT4_FREE_BLOCKS_METADATA,
 			    inode, bh, block);
 	}
@@ -4912,6 +5749,13 @@ do_more:
 		new_entry->efd_count = count_clusters;
 		new_entry->efd_tid = handle->h_transaction->t_tid;
 
+		/* free node in freespace_tree */
+		if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+			err = ext4_mb_freespace_free_blocks(sb, block, block_group, count_clusters);
+			if (err)
+				goto error_return;
+		}
+
 		ext4_lock_group(sb, block_group);
 		mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
 		ext4_mb_free_metadata(handle, &e4b, new_entry);
@@ -4930,11 +5774,20 @@ do_more:
 					 err);
 		} else
 			EXT4_MB_GRP_CLEAR_TRIMMED(e4b.bd_info);
+		
+		/* free node in freespace_tree */
+		if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+			err = ext4_mb_freespace_free_blocks(sb, block, block_group, count_clusters);
+			if (err)
+				goto error_return;
+		}
 
 		ext4_lock_group(sb, block_group);
 		mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
 		mb_free_blocks(inode, &e4b, bit, count_clusters);
 	}
+
+
 
 	ret = ext4_free_group_clusters(sb, gdp) + count_clusters;
 	ext4_free_group_clusters_set(sb, gdp, ret);

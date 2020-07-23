@@ -59,7 +59,7 @@
  * with DOUBLE_CHECK defined mballoc creates persistent in-core
  * bitmaps, maintains and uses them to check for double allocations
  */
-#define DOUBLE_CHECK__
+#define DOUBLE_CHECK
 
 /*
  * Define EXT4FS_DEBUG to produce debug messages
@@ -1390,6 +1390,15 @@ struct ext4_super_block {
 	(sbi->s_encoding_flags & EXT4_ENC_STRICT_MODE_FL)
 
 /*
+ * Struct containing rb_node 
+ * for tracking free spaces using Red Black tree
+ */
+struct ext4_freespace_root {
+	struct rb_root frsp_t_root;
+	struct mutex frsp_t_lock; 
+};
+
+/*
  * fourth extended-fs super-block data in memory
  */
 struct ext4_sb_info {
@@ -1523,6 +1532,9 @@ struct ext4_sb_info {
 	unsigned int s_log_groups_per_flex;
 	struct flex_groups * __rcu *s_flex_groups;
 	ext4_group_t s_flex_groups_allocated;
+
+	/* rb_tree roots for flex_groups */
+	struct ext4_freespace_root *s_mb_freespace_trees;
 
 	/* workqueue for reserved extent conversions (buffered io) */
 	struct workqueue_struct *rsv_conversion_wq;
@@ -2633,6 +2645,8 @@ extern long ext4_mb_max_to_scan;
 extern int ext4_mb_init(struct super_block *);
 extern int ext4_mb_release(struct super_block *);
 extern ext4_fsblk_t ext4_mb_new_blocks(handle_t *,
+				struct ext4_allocation_request *, int *);
+extern ext4_fsblk_t ext4_mb_freespace_tree_new_blocks(handle_t *,
 				struct ext4_allocation_request *, int *);
 extern int ext4_mb_reserve_blocks(struct super_block *, int);
 extern void ext4_discard_preallocations(struct inode *);

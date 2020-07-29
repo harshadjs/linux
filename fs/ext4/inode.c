@@ -3484,7 +3484,8 @@ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
 	 */
 	if (flags & (IOMAP_WRITE | IOMAP_DIRECT) && written == 0)
 		return -ENOTBLK;
-
+	if ((flags & IOMAP_WRITE) && test_opt(inode->i_sb, DAX))
+		ext4_fc_track_iomap(inode, iomap);
 	return 0;
 }
 

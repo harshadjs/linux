@@ -28,8 +28,6 @@ MODULE_PARM_DESC(mballoc_debug, "Debugging level for ext4's mballoc");
 /* disable print statements */
 #define printk(...)
 
-
-
 /*
  * MUSTDO:
  *   - test ext4_ext_search_left() and ext4_ext_search_right()
@@ -380,15 +378,13 @@ static inline void *mb_correct_addr_and_bit(int *bit, void *addr)
 static inline unsigned int ext4_blkno_to_flex_offset(struct super_block *sb, ext4_fsblk_t blkno)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
-	ext4_group_t groups_per_flex = 1 << sbi->s_es->s_log_groups_per_flex;
-	return blkno % (groups_per_flex*sbi->s_blocks_per_group);
+	return blkno % (ext4_flex_bg_size(sbi)*sbi->s_blocks_per_group);
 }
 
 static inline ext4_fsblk_t ext4_flex_offset_to_blkno(struct super_block *sb, unsigned int i, unsigned int flex_offset)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
-	ext4_group_t groups_per_flex = 1 << sbi->s_es->s_log_groups_per_flex;
-	return i*groups_per_flex*sbi->s_blocks_per_group + flex_offset;
+	return i*ext4_flex_bg_size(sbi)*sbi->s_blocks_per_group + flex_offset;
 }
 
 
@@ -2583,6 +2579,7 @@ int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void
 	/* Case 0: empty tree */
 	first_node = rb_first(&tree->frsp_t_root);
 	if (!first_node) {
+		printk(KERN_ERR "**Empty tree");
 		for (; i < end; i++) {
 			mb_set_bit(i-start, bitmap);
 		}
@@ -2591,6 +2588,7 @@ int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void
 
 	/* Case 1: group starts before the first_node in tree */
 	if (cur_node == NULL){
+		printk(KERN_ERR "**Before First");
 		cur = rb_entry(first_node, struct ext4_freespace_node, frsp_node);
 	}
 	else{
@@ -2669,7 +2667,6 @@ void ext4_mb_print_freespace_tree(struct super_block *sb, struct ext4_freespace_
 	return;
 }
 
-
 /*
  * Load freespace_tree from on-disk bitmaps
  * 
@@ -2700,6 +2697,7 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		next = mb_find_next_bit(bh->b_data, end, bit);
 		length = next - bit; 
 		blk_no = (ext4_group_first_block_no(sb, group) + bit);
+
 		offset =  blk_no % (groups_per_flex*sbi->s_blocks_per_group);
 		
 		/* create new tree node */
@@ -2742,11 +2740,11 @@ int ext4_mb_load_freespace_trees(struct super_block *sb, ext4_group_t group,
 		bit = next + 1;
 	}
 	ext4_mb_print_freespace_tree(sb, tree, flex_idx);
+
 	mutex_unlock(&tree->frsp_t_lock);
 
 	return err;
 }
-
 
 /* Create and initialize ext4_group_info data for the given group. */
 int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
@@ -5079,7 +5077,7 @@ int ext4_mb_freespace_find_by_goal(struct ext4_allocation_context *ac, unsigned 
 	struct ext4_freespace_node *cur = NULL;
 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
 
-	if (!(ac->ac_flags & EXT4_MB_HINT_TRY_GOAL)){
+  if (!(ac->ac_flags & EXT4_MB_HINT_TRY_GOAL)){
 		return ret;
 	}
 	
@@ -5088,6 +5086,7 @@ int ext4_mb_freespace_find_by_goal(struct ext4_allocation_context *ac, unsigned 
 	tree_goal = ext4_blkno_to_flex_offset(ac->ac_sb, blk);	
 	tree = &(sbi->s_mb_freespace_trees[i]);
 	/*ext4_mb_print_freespace_tree(ac->ac_sb, tree, i);*/
+
 
 	/* try goal block and its freespace_tree first */
 	mutex_lock(&tree->frsp_t_lock);

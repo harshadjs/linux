@@ -59,7 +59,7 @@
  * with DOUBLE_CHECK defined mballoc creates persistent in-core
  * bitmaps, maintains and uses them to check for double allocations
  */
-#define DOUBLE_CHECK
+#define DOUBLE_CHECK__
 
 /*
  * Define EXT4FS_DEBUG to produce debug messages
@@ -1396,6 +1396,7 @@ struct ext4_super_block {
 struct ext4_freespace_root {
 	struct rb_root frsp_t_root;
 	struct mutex frsp_t_lock; 
+	int loaded;  			/* flag to check if this tree has been loaded */
 };
 
 /*

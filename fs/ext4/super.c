@@ -1521,7 +1521,7 @@ enum {
 	Opt_dioread_nolock, Opt_dioread_lock,
 	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
 	Opt_max_dir_size_kb, Opt_nojournal_checksum, Opt_nombcache,
-	Opt_no_fc, Opt_fc_soft_consistency
+	Opt_no_fc, Opt_fc_soft_consistency, Opt_freespace_tree,
 };
 
 static const match_table_t tokens = {
@@ -1607,6 +1607,7 @@ static const match_table_t tokens = {
 	{Opt_noinit_itable, "noinit_itable"},
 	{Opt_no_fc, "no_fc"},
 	{Opt_fc_soft_consistency, "fc_soft_consistency"},
+	{Opt_freespace_tree, "freespace_tree"},
 	{Opt_max_dir_size_kb, "max_dir_size_kb=%u"},
 	{Opt_test_dummy_encryption, "test_dummy_encryption"},
 	{Opt_nombcache, "nombcache"},
@@ -1825,6 +1826,8 @@ static const struct mount_opts {
 	{Opt_no_fc, EXT4_MOUNT2_JOURNAL_FAST_COMMIT,
 	 MOPT_CLEAR | MOPT_2 | MOPT_EXT4_ONLY},
 	{Opt_fc_soft_consistency, EXT4_MOUNT2_JOURNAL_FC_SOFT_CONSISTENCY,
+	 MOPT_SET | MOPT_2 | MOPT_EXT4_ONLY},
+	{Opt_freespace_tree, EXT4_MOUNT2_FREESPACE_TREE,
 	 MOPT_SET | MOPT_2 | MOPT_EXT4_ONLY},
 	{Opt_err, 0, 0}
 };

@@ -2799,13 +2799,11 @@ int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
 	return 0;
 }
 
-
 /*
  * Group-level freespace_tree --> bitmap conversion
  *
  * Given a group and a bitmap address,
  * update the content of this group bitmap
- * based on latest freespace_tree.
  */
 int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void *bitmap)
 {
@@ -2894,7 +2892,6 @@ int ext4_mb_update_group_bitmap(struct super_block *sb, ext4_group_t group, void
 	return ret;
 }
 
-
 /* Create and initialize ext4_group_info data for the given group. */
 int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 			  struct ext4_group_desc *desc)
@@ -2967,6 +2964,7 @@ int ext4_mb_add_groupinfo(struct super_block *sb, ext4_group_t group,
 		/* map contents of bitmap into freespace trees*/
 		if (test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
 			err = ext4_bb_to_tree(sb, group, bh);
+
 			/*
 			temp = kzalloc(sb->s_blocksize, GFP_KERNEL);
 			ext4_mb_update_group_bitmap(sb, group, temp);
@@ -4865,7 +4863,6 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	ac->ac_b_tree_ex.te_idx = 0;
 	ac->ac_b_tree_ex.te_len = 0;
 
-
 	/* we have to define context: we'll we work with a file or
 	 * locality group. this is a policy, actually */
 	ext4_mb_group_or_file(ac);
@@ -5179,6 +5176,7 @@ static void ext4_mb_measure_node(struct ext4_allocation_context *ac,
 	if (unlikely(ac->ac_flags & EXT4_MB_HINT_FIRST)) {
 		best_found = 1;
 		goto use_extent;
+
 	}
 
 	/*
@@ -5310,7 +5308,6 @@ repeat:
 	for (j = 0; (j < ntrees) && ac->ac_status == AC_STATUS_CONTINUE; j++) {
 		tree_idx = (i+j) % ntrees;
 		tree = &(sbi->s_mb_freespace_trees[tree_idx]);
-
 		mutex_lock(&tree->frsp_lock);
 
 		/* check if alreday loaded this tree */
@@ -5323,7 +5320,7 @@ repeat:
 			}
 		}
 
-		node = rb_first(&tree->frsp_root);
+    node = rb_first(&tree->frsp_root);
 		while (node && ac->ac_status == AC_STATUS_CONTINUE) {
 			cur = rb_entry(node, struct ext4_freespace_node, frsp_node);
 			ext4_mb_measure_node(ac, tree_idx, cur);
@@ -5460,6 +5457,11 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	might_sleep();
 	sb = ar->inode->i_sb;
 	sbi = EXT4_SB(sb);
+
+	/* use freespace tree allocator */
+	if (test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex){
+		return ext4_mb_freespace_tree_new_blocks(handle, ar, errp);
+	}
 
 	trace_ext4_request_blocks(ar);
 
@@ -5702,6 +5704,68 @@ ext4_mb_free_metadata(handle_t *handle, struct ext4_buddy *e4b,
 	return 0;
 }
 
+int ext4_mb_freespace_free_blocks(struct super_block *sb, ext4_fsblk_t block, 
+								ext4_group_t group, unsigned int length)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	unsigned int i = group >> sbi->s_log_groups_per_flex;
+	struct ext4_freespace_root *tree = &(sbi->s_mb_freespace_trees[i]);
+	struct ext4_freespace_node *new_entry = NULL, *next_entry = NULL, *prev_entry = NULL;
+	struct rb_node *new_node = NULL, *left = NULL, *right = NULL;	
+	unsigned int offset;
+	int err = 0;
+
+	offset = ext4_blkno_to_flex_offset(sb, block);
+	/* create new tree node */
+	new_entry = kmem_cache_alloc(ext4_freespace_node_cachep, GFP_NOFS);
+	new_entry->frsp_offset = EXT4_NUM_B2C(sbi, offset);
+	new_entry->frsp_length = length;
+	new_node = &new_entry->frsp_node;
+
+	/* insert to tree */
+	err = ext4_mb_freespace_node_insert(&tree->frsp_t_root, new_entry);
+	if (err) {
+		printk(KERN_ERR "Group %u: Failed to FREE and insert node containing freeblocks starting at %u into Tree %u\n", 
+					group, offset, i);
+		return err;
+	}
+
+	/* TODO: should we consider the case when length acrosses tree boundaries? */
+
+	mutex_lock(&tree->frsp_t_lock);
+	/* try merge to left and right */
+	/* left */
+	left = rb_prev(new_node);
+	if (left){
+		prev_entry = rb_entry(left, struct ext4_freespace_node, frsp_node);
+		if (ext4_mb_freespace_node_can_merge(sb, prev_entry, new_entry)) {
+			/*printk(KERN_ERR "FREE: Merge to left: %u %u\n", prev_entry->frsp_offset, new_entry->frsp_offset);*/
+			new_entry->frsp_offset = prev_entry->frsp_offset;
+			new_entry->frsp_length += prev_entry->frsp_length;
+			rb_erase(left, &tree->frsp_t_root);
+			kmem_cache_free(ext4_freespace_node_cachep, prev_entry);
+			/*printk(KERN_ERR "FREE: merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);*/
+		}
+	}
+
+	/* right */
+	right = rb_next(new_node);
+	if (right){
+		next_entry = rb_entry(right, struct ext4_freespace_node, frsp_node);
+		if (ext4_mb_freespace_node_can_merge(sb, new_entry, next_entry)) {
+			/*printk(KERN_ERR "FREE: Merge to right: %u %u\n", new_entry->frsp_offset, next_entry->frsp_offset);*/
+			new_entry->frsp_length += next_entry->frsp_length;
+			rb_erase(right, &tree->frsp_t_root);
+			kmem_cache_free(ext4_freespace_node_cachep, next_entry);
+			/*printk(KERN_ERR "FREE: merged entry starting at %u, total length = %u\n", new_entry->frsp_offset, new_entry->frsp_length);*/
+		}
+	}
+	mutex_unlock(&tree->frsp_t_lock);
+	
+	return 0;
+}
+
+
 /**
  * ext4_free_blocks() -- Free given blocks and update quota
  * @handle:		handle for this transaction
@@ -5863,7 +5927,7 @@ do_more:
 	}
 #endif
 	trace_ext4_mballoc_free(sb, inode, block_group, bit, count_clusters);
-	
+
 	/* __GFP_NOFAIL: retry infinitely, ignore TIF_MEMDIE and memcg limit. */
 	err = ext4_mb_load_buddy_gfp(sb, block_group, &e4b,
 					GFP_NOFS|__GFP_NOFAIL);
@@ -5909,9 +5973,80 @@ do_more:
 		} else
 			EXT4_MB_GRP_CLEAR_TRIMMED(e4b.bd_info);
 
+		err = ext4_mb_freespace_free_blocks(sb, block, block_group, count_clusters);
+		if (err)
+			goto error_return;
+		
 		ext4_lock_group(sb, block_group);
 		mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
-		mb_free_blocks(inode, &e4b, bit, count_clusters);
+
+	/* buddy-bitmap */
+	} else {
+
+		/* __GFP_NOFAIL: retry infinitely, ignore TIF_MEMDIE and memcg limit. */
+		err = ext4_mb_load_buddy_gfp(sb, block_group, &e4b,
+						GFP_NOFS|__GFP_NOFAIL);
+		if (err)
+			goto error_return;
+
+		/*
+		* We need to make sure we don't reuse the freed block until after the
+		* transaction is committed. We make an exception if the inode is to be
+		* written in writeback mode since writeback mode has weak data
+		* consistency guarantees.
+		*/
+		if (ext4_handle_valid(handle) &&
+			((flags & EXT4_FREE_BLOCKS_METADATA) ||
+			!ext4_should_writeback_data(inode))) {
+			struct ext4_free_data *new_entry;
+			/*
+			* We use __GFP_NOFAIL because ext4_free_blocks() is not allowed
+			* to fail.
+			*/
+			new_entry = kmem_cache_alloc(ext4_free_data_cachep,
+					GFP_NOFS|__GFP_NOFAIL);
+			new_entry->efd_start_cluster = bit;
+			new_entry->efd_group = block_group;
+			new_entry->efd_count = count_clusters;
+			new_entry->efd_tid = handle->h_transaction->t_tid;
+
+			/* free node in freespace_tree */
+			if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+				err = ext4_mb_freespace_free_blocks(sb, block, block_group, count_clusters);
+				if (err)
+					goto error_return;
+			}
+
+			ext4_lock_group(sb, block_group);
+			mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
+			ext4_mb_free_metadata(handle, &e4b, new_entry);
+		} else {
+			/* need to update group_info->bb_free and bitmap
+			* with group lock held. generate_buddy look at
+			* them with group lock_held
+			*/
+			if (test_opt(sb, DISCARD)) {
+				err = ext4_issue_discard(sb, block_group, bit, count,
+							NULL);
+				if (err && err != -EOPNOTSUPP)
+					ext4_msg(sb, KERN_WARNING, "discard request in"
+						" group:%d block:%d count:%lu failed"
+						" with %d", block_group, bit, count,
+						err);
+			} else
+				EXT4_MB_GRP_CLEAR_TRIMMED(e4b.bd_info);
+			
+			/* free node in freespace_tree */
+			if(test_opt2(sb, FREESPACE_TREE) && sbi->s_es->s_log_groups_per_flex) {
+				err = ext4_mb_freespace_free_blocks(sb, block, block_group, count_clusters);
+				if (err)
+					goto error_return;
+			}
+
+			ext4_lock_group(sb, block_group);
+			mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
+			mb_free_blocks(inode, &e4b, bit, count_clusters);
+		}
 	}
 
 
@@ -5940,7 +6075,8 @@ do_more:
 				   count_clusters);
 	}
 
-	ext4_mb_unload_buddy(&e4b);
+	if(!test_opt2(sb, FREESPACE_TREE) || !sbi->s_es->s_log_groups_per_flex)
+		ext4_mb_unload_buddy(&e4b);
 
 	/* We dirtied the bitmap block */
 	BUFFER_TRACE(bitmap_bh, "dirtied bitmap block");

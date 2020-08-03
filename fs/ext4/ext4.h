@@ -1394,9 +1394,9 @@ struct ext4_super_block {
  * for tracking free spaces using Red Black tree
  */
 struct ext4_freespace_root {
-	struct rb_root frsp_t_root;
-	struct mutex frsp_t_lock;
-	int loaded;			/* flag to check if this tree has been loaded */
+	struct rb_root frsp_root;
+	struct mutex frsp_lock;
+	__u8 frsp_loaded;			/* flag to check if this tree has been loaded */
 };
 
 /*

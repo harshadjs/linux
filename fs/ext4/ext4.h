@@ -185,6 +185,12 @@ struct ext4_map_blocks {
 	unsigned int m_flags;
 };
 
+struct ext4_sg_map_blocks {
+	struct list_head list;
+	ext4_lblk_t sg_lblk;
+	unsigned int sg_len;
+};
+
 /*
  * Block validity checking, system zone rbtree.
  */
@@ -1116,6 +1122,9 @@ struct ext4_inode_info {
 	__u32 i_csum_seed;
 
 	kprojid_t i_projid;
+
+	/* list of strong guarantee inserted extents */
+	struct ext4_sg_map_blocks i_sg_list;
 };
 
 /*
@@ -1200,6 +1209,7 @@ struct ext4_inode_info {
 						specified journal checksum */
 
 #define EXT4_MOUNT2_JOURNAL_FAST_COMMIT	0x00000010 /* Journal fast commit */
+#define EXT4_MOUNT2_STRONG_GUARANTEES 0x00000100 /* Enable strong guarantees feature */
 
 #define clear_opt(sb, opt)		EXT4_SB(sb)->s_mount_opt &= \
 						~EXT4_MOUNT_##opt
@@ -3434,6 +3444,8 @@ extern int ext4_check_blockref(const char *, unsigned int,
 /* extents.c */
 struct ext4_ext_path;
 struct ext4_extent;
+extern int perform_ext4_collapse_range(struct inode *inode, loff_t offset, loff_t len);
+extern int perform_ext4_insert_range(struct inode *inode, loff_t offset, loff_t len);
 
 /*
  * Maximum number of logical blocks in a file; ext4_extent's ee_block is

@@ -48,6 +48,9 @@
 
 #include <trace/events/ext4.h>
 
+#define ext4_fc_track_sg(...)
+#define ext4_fc_untrack_sg(...)
+
 static __u32 ext4_inode_csum(struct inode *inode, struct ext4_inode *raw,
 			      struct ext4_inode_info *ei)
 {
@@ -3422,6 +3425,38 @@ retry:
 	return ret;
 }
 
+/*
+ * This function adds the insert range operation to a per-inode 
+ * insert range list. We have explicitly not held a lock when 
+ * changing the list because this function is called from 
+ * ext4_iomap_begin, whose caller hold the inode's lock.
+ */
+static void ext4_sg_list_add(struct inode *inode, 
+	struct ext4_sg_map_blocks *sg_op)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	list_add(&sg_op->list, &((ei->i_sg_list.list)));
+}
+
+/*
+ * This function deletes all the old data copies once the 
+ * updates are successful. This is so that we prevent eating
+ * up the free space with unnecessary copies of old data.
+ */
+static void ext4_sg_list_del(struct inode *inode)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	struct ext4_sg_map_blocks *sg_op;
+	struct list_head *p, *q;
+	list_for_each_safe(p, q, &((ei->i_sg_list.list))) {
+		sg_op = list_entry(p, struct ext4_sg_map_blocks, list);
+		// ext4_fc_untrack_coow(inode, sg_op->sg_pblk, 
+		// 	sg_op->sg_pblk + sg_op->sg_len);
+		perform_ext4_collapse_range(inode, sg_op->sg_lblk, sg_op->sg_len);
+		list_del(p);
+		kfree(sg_op);
+    }
+}
 
 static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned flags, struct iomap *iomap, struct iomap *srcmap)
@@ -3447,6 +3482,44 @@ static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		ret = ext4_iomap_alloc(inode, &map, flags);
 	else
 		ret = ext4_map_blocks(NULL, inode, &map, 0);
+
+	if((flags & IOMAP_WRITE) && (ret > 0) && 
+		(EXT4_SB(inode->i_sb)->s_mount_opt & EXT4_MOUNT2_STRONG_GUARANTEES) && 
+		(map.m_flags & EXT4_MAP_MAPPED) && 
+		(!(map.m_flags & EXT4_MAP_NEW)) && IS_DAX(inode) && 
+		(inode->i_ino >= 12) && 
+		!(EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY)) {
+
+		/*
+		 * When data is being modified, we want to insert range *before*
+		 * the old data, and copy the new data there, then collapse
+		 * the range for old data in iomap_end.
+		 * 
+		 * Algorithm for correctly providing strong guarantees:
+		 * 1. insert_range before the offset being modified
+		 * 2. add new FC entry to track newly inserted range
+		 * 3. let the data write happen
+		 * 4. delete the old data in iomap_end using collapse_range
+		 * 5. add an FC entry to disregard the range you told it to consider
+		 */
+		int range_ret = -1;
+		struct extent_status es;
+		struct ext4_sg_map_blocks *sg_op = NULL;
+		range_ret = perform_ext4_insert_range(inode, map.m_lblk, map.m_len);
+		if(range_ret != 0) {
+			// fail the on-going command and force it to retry
+			return range_ret;
+		}
+		BUG_ON(!ext4_es_lookup_extent(inode, map.m_lblk, NULL, &es));
+		// ext4_fc_track_sg(inode, map.m_lblk, old_copy_data_len + old_copy_pblock);
+		sg_op = kmalloc(sizeof(struct ext4_sg_map_blocks), GFP_KERNEL);
+		sg_op->sg_lblk = map.m_lblk + map.m_len;
+		sg_op->sg_len = map.m_len;
+		ext4_sg_list_add(inode, sg_op);
+		map.m_pblk = ext4_es_pblock(&es) + map.m_lblk - es.es_lblk;
+
+		//FIXME: track range using FC
+	}
 
 	if (ret < 0)
 		return ret;
@@ -3484,6 +3557,14 @@ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
 	 */
 	if (flags & (IOMAP_WRITE | IOMAP_DIRECT) && written == 0)
 		return -ENOTBLK;
+
+	if((flags & IOMAP_WRITE) && 
+		(EXT4_SB(inode->i_sb)->s_mount_opt & EXT4_MOUNT2_STRONG_GUARANTEES) && 
+		(iomap->type = IOMAP_MAPPED) &&
+		(!(iomap->flags & IOMAP_F_NEW)) && IS_DAX(inode) && 
+		(inode->i_ino >= 12)) {
+		ext4_sg_list_del(inode);
+	}
 
 	return 0;
 }

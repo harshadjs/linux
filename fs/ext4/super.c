@@ -1529,7 +1529,7 @@ enum {
 	Opt_dioread_nolock, Opt_dioread_lock,
 	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
 	Opt_max_dir_size_kb, Opt_nojournal_checksum, Opt_nombcache,
-	Opt_no_fc, Opt_fc_debug_max_replay, Opt_fc_force
+	Opt_no_fc, Opt_fc_debug_max_replay, Opt_fc_force, Opt_sg
 };
 
 static const match_table_t tokens = {
@@ -1627,6 +1627,7 @@ static const match_table_t tokens = {
 	{Opt_removed, "reservation"},	/* mount option from ext2/3 */
 	{Opt_removed, "noreservation"}, /* mount option from ext2/3 */
 	{Opt_removed, "journal=%u"},	/* mount option from ext2/3 */
+	{Opt_sg, "sg"},
 	{Opt_err, NULL},
 };
 
@@ -1791,6 +1792,8 @@ static const struct mount_opts {
 	{Opt_inode_readahead_blks, 0, MOPT_GTE0},
 	{Opt_init_itable, 0, MOPT_GTE0},
 	{Opt_dax, EXT4_MOUNT_DAX, MOPT_SET},
+	{Opt_sg, EXT4_MOUNT2_STRONG_GUARANTEES,
+	 MOPT_SET | MOPT_2 | MOPT_EXT4_ONLY},
 	{Opt_stripe, 0, MOPT_GTE0},
 	{Opt_resuid, 0, MOPT_GTE0},
 	{Opt_resgid, 0, MOPT_GTE0},
@@ -2119,6 +2122,9 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
 		ext4_msg(sb, KERN_INFO, "dax option not supported");
 		return -1;
 #endif
+	} else if (token == Opt_sg) {
+		ext4_msg(sb, KERN_INFO, "Strong guaratees mode enabled");
+		sbi->s_mount_opt |= m->mount_opt;
 	} else if (token == Opt_data_err_abort) {
 		sbi->s_mount_opt |= m->mount_opt;
 	} else if (token == Opt_data_err_ignore) {

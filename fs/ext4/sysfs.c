@@ -527,6 +527,8 @@ int ext4_register_sysfs(struct super_block *sb)
 					ext4_fc_info_show, sb);
 		proc_create_seq_data("mb_groups", S_IRUGO, sbi->s_proc,
 				&ext4_mb_seq_groups_ops, sb);
+		proc_create_seq_data("mb_structs", S_IRUGO, sbi->s_proc,
+				&ext4_mb_seq_structs_ops, sb);
 	}
 	return 0;
 }

@@ -161,6 +161,7 @@ struct ext4_allocation_context {
 	/* copy of the best found extent taken before preallocation efforts */
 	struct ext4_free_extent ac_f_ex;
 
+	__u32 ac_groups_considered;
 	__u16 ac_groups_scanned;
 	__u16 ac_found;
 	__u16 ac_tail;

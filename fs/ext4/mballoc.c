@@ -877,6 +877,9 @@ static int ext4_mb_choose_next_group_cr0(struct ext4_allocation_context *ac,
 	if (ac->ac_status == AC_STATUS_FOUND)
 		return 1;
 
+	if (unlikely(sbi->s_mb_stats && ac->ac_flags & EXT4_MB_CR0_OPTIMIZED))
+		atomic_inc(&sbi->s_bal_cr0_bad_suggestions);
+
 	grp = NULL;
 	for (i = ac->ac_2order; i < MB_NUM_ORDERS(ac->ac_sb); i++) {
 		if (list_empty(&sbi->s_mb_largest_free_orders[i]))
@@ -889,7 +892,8 @@ static int ext4_mb_choose_next_group_cr0(struct ext4_allocation_context *ac,
 		grp = NULL;
 		list_for_each_entry(iter, &sbi->s_mb_largest_free_orders[i],
 				    bb_largest_free_order_node) {
-			ac->ac_groups_considered++;
+			if (sbi->s_mb_stats)
+				atomic64_inc(&sbi->s_bal_cX_groups_considered[0]);
 			if (likely(ext4_mb_good_group(ac, iter->bb_group, 0))) {
 				grp = iter;
 				break;
@@ -906,6 +910,7 @@ static int ext4_mb_choose_next_group_cr0(struct ext4_allocation_context *ac,
 	} else {
 		*group = grp->bb_group;
 		ac->ac_last_optimal_group = *group;
+		ac->ac_flags |= EXT4_MB_CR0_OPTIMIZED;
 	}
 	return 0;
 }
@@ -932,14 +937,17 @@ static int ext4_mb_choose_next_group_cr1(struct ext4_allocation_context *ac,
 	if (!read_trylock(&sbi->s_mb_rb_lock))
 		return 1;
 
-	if (ac->ac_flags & EXT4_MB_CR1_OPTIMIZED) {
+	if (unlikely(ac->ac_flags & EXT4_MB_CR1_OPTIMIZED)) {
+		if (sbi->s_mb_stats)
+			atomic_inc(&sbi->s_bal_cr1_bad_suggestions);
 		/* We have found something at CR 1 in the past */
 		grp = ext4_get_group_info(ac->ac_sb, ac->ac_last_optimal_group);
 		for (found = rb_next(&grp->bb_avg_fragment_size_rb); found != NULL;
 		     found = rb_next(found)) {
 			grp = rb_entry(found, struct ext4_group_info,
 				       bb_avg_fragment_size_rb);
-			ac->ac_groups_considered++;
+			if (sbi->s_mb_stats)
+				atomic64_inc(&sbi->s_bal_cX_groups_considered[1]);
 			if (likely(ext4_mb_good_group(ac, grp->bb_group, 1)))
 				break;
 		}
@@ -2458,7 +2466,8 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 	ext4_grpblk_t free;
 	int ret = 0;
 
-	ac->ac_groups_considered++;
+	if (sbi->s_mb_stats)
+		atomic64_inc(&sbi->s_bal_cX_groups_considered[ac->ac_criteria]);
 	if (should_lock)
 		ext4_lock_group(sb, group);
 	free = grp->bb_free;
@@ -2769,6 +2778,9 @@ repeat:
 			goto repeat;
 		}
 	}
+
+	if (sbi->s_mb_stats && ac->ac_status == AC_STATUS_FOUND)
+		atomic64_inc(&sbi->s_bal_cX_hits[ac->ac_criteria]);
 out:
 	if (!err && ac->ac_status != AC_STATUS_FOUND && first_err)
 		err = first_err;
@@ -2883,21 +2895,44 @@ int ext4_seq_mb_stats_show(struct seq_file *seq, void *offset)
 	seq_printf(seq, "\tsuccess: %u\n", atomic_read(&sbi->s_bal_success));
 
 	seq_printf(seq, "\tgroups_scanned: %u\n",  atomic_read(&sbi->s_bal_groups_scanned));
-	seq_printf(seq, "\tgroups_considered: %u\n",  atomic_read(&sbi->s_bal_groups_considered));
+
+	seq_puts(seq, "\tcr0_stats:\n");
+	seq_printf(seq, "\t\thits: %llu\n", atomic64_read(&sbi->s_bal_cX_hits[0]));
+	seq_printf(seq, "\t\tgroups_considered: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_groups_considered[0]));
+	seq_printf(seq, "\t\tuseless_loops: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_failed[0]));
+	seq_printf(seq, "\t\tbad_suggestions: %u\n",
+		   atomic_read(&sbi->s_bal_cr0_bad_suggestions));
+
+	seq_puts(seq, "\tcr1_stats:\n");
+	seq_printf(seq, "\t\thits: %llu\n", atomic64_read(&sbi->s_bal_cX_hits[1]));
+	seq_printf(seq, "\t\tgroups_considered: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_groups_considered[1]));
+	seq_printf(seq, "\t\tuseless_loops: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_failed[1]));
+	seq_printf(seq, "\t\tbad_suggestions: %u\n",
+		   atomic_read(&sbi->s_bal_cr1_bad_suggestions));
+
+	seq_puts(seq, "\tcr2_stats:\n");
+	seq_printf(seq, "\t\thits: %llu\n", atomic64_read(&sbi->s_bal_cX_hits[2]));
+	seq_printf(seq, "\t\tgroups_considered: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_groups_considered[2]));
+	seq_printf(seq, "\t\tuseless_loops: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_failed[2]));
+
+	seq_puts(seq, "\tcr3_stats:\n");
+	seq_printf(seq, "\t\thits: %llu\n", atomic64_read(&sbi->s_bal_cX_hits[3]));
+	seq_printf(seq, "\t\tgroups_considered: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_groups_considered[3]));
+	seq_printf(seq, "\t\tuseless_loops: %llu\n",
+		   atomic64_read(&sbi->s_bal_cX_failed[3]));
 	seq_printf(seq, "\textents_scanned: %u\n", atomic_read(&sbi->s_bal_ex_scanned));
 	seq_printf(seq, "\t\tgoal_hits: %u\n", atomic_read(&sbi->s_bal_goals));
 	seq_printf(seq, "\t\t2^n_hits: %u\n", atomic_read(&sbi->s_bal_2orders));
 	seq_printf(seq, "\t\tbreaks: %u\n", atomic_read(&sbi->s_bal_breaks));
 	seq_printf(seq, "\t\tlost: %u\n", atomic_read(&sbi->s_mb_lost_chunks));
 
-	seq_printf(seq, "\tuseless_c0_loops: %llu\n",
-		   (unsigned long long)atomic64_read(&sbi->s_bal_cX_failed[0]));
-	seq_printf(seq, "\tuseless_c1_loops: %llu\n",
-		   (unsigned long long)atomic64_read(&sbi->s_bal_cX_failed[1]));
-	seq_printf(seq, "\tuseless_c2_loops: %llu\n",
-		   (unsigned long long)atomic64_read(&sbi->s_bal_cX_failed[2]));
-	seq_printf(seq, "\tuseless_c3_loops: %llu\n",
-		   (unsigned long long)atomic64_read(&sbi->s_bal_cX_failed[3]));
 	seq_printf(seq, "\tbuddies_generated: %u/%u\n",
 		   atomic_read(&sbi->s_mb_buddies_generated),
 		   ext4_get_groups_count(sb));
@@ -3363,16 +3398,6 @@ int ext4_mb_init(struct super_block *sb)
 		sbi->s_mb_linear_limit = 0;
 	else
 		sbi->s_mb_linear_limit = MB_DEFAULT_LINEAR_LIMIT;
-#ifndef CONFIG_EXT4_DEBUG
-	/*
-	 * Disable mb_optimize scan if we don't have enough groups. If
-	 * CONFIG_EXT4_DEBUG is set, we don't disable this MB_OPTIMIZE_SCAN even
-	 * for small file systems. This allows us to test correctness on small
-	 * file systems.
-	 */
-	if (ext4_get_groups_count(sb) < MB_DEFAULT_LINEAR_SCAN_THRESHOLD)
-		clear_opt2(sb, MB_OPTIMIZE_SCAN);
-#endif
 	/* init file for buddy data */
 	ret = ext4_mb_init_backend(sb);
 	if (ret != 0)
@@ -4059,14 +4084,13 @@ static void ext4_mb_collect_stats(struct ext4_allocation_context *ac)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
 
-	if (sbi->s_mb_stats && ac->ac_g_ex.fe_len > 1) {
+	if (sbi->s_mb_stats && ac->ac_g_ex.fe_len >= 1) {
 		atomic_inc(&sbi->s_bal_reqs);
 		atomic_add(ac->ac_b_ex.fe_len, &sbi->s_bal_allocated);
 		if (ac->ac_b_ex.fe_len >= ac->ac_o_ex.fe_len)
 			atomic_inc(&sbi->s_bal_success);
 		atomic_add(ac->ac_found, &sbi->s_bal_ex_scanned);
 		atomic_add(ac->ac_groups_scanned, &sbi->s_bal_groups_scanned);
-		atomic_add(ac->ac_groups_considered, &sbi->s_bal_groups_considered);
 		if (ac->ac_g_ex.fe_start == ac->ac_b_ex.fe_start &&
 				ac->ac_g_ex.fe_group == ac->ac_b_ex.fe_group)
 			atomic_inc(&sbi->s_bal_goals);

@@ -530,6 +530,8 @@ static int __track_inode(struct inode *inode, void *arg, bool update)
  * committed, this function will wait for the commit to finish.
  */
 void ext4_fc_track_inode(handle_t *handle, struct inode *inode)
+__acquires(fc_committing_lock)
+__releases(fc_committing_lock)
 {
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	wait_queue_head_t *wq;
@@ -554,17 +556,17 @@ void ext4_fc_track_inode(handle_t *handle, struct inode *inode)
 
 	if (!test_opt2(inode->i_sb, JOURNAL_FAST_COMMIT) ||
 	    (EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY) ||
-		ext4_test_mount_flag(inode->i_sb, EXT4_MF_FC_INELIGIBLE) ||
-		!list_empty(&ei->i_fc_list))
+	    ext4_test_mount_flag(inode->i_sb, EXT4_MF_FC_INELIGIBLE))
 		return;
 
 	/*
 	 * If we come here, we may sleep while waiting for the inode to
-	 * commit. We shouldn't be holding i_data_sem in write mode when we go
-	 * to sleep since the commit path needs to grab the lock while
-	 * committing the inode.
+	 * commit. We shouldn't be holding i_data_sem when we go to sleep since
+	 * the commit path needs to grab the lock while committing the inode.
 	 */
-	WARN_ON(lockdep_is_held_type(&ei->i_data_sem, 1));
+#ifdef CONFIG_LOCKDEP
+	WARN_ON(lockdep_is_held(&ei->i_data_sem));
+#endif
 
 	while (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
 #if (BITS_PER_LONG < 64)
@@ -1066,6 +1068,8 @@ lock_and_exit:
 }
 
 static int ext4_fc_perform_commit(journal_t *journal)
+__acquires(fc_committing_lock)
+__releases(fc_committing_lock)
 {
 	struct super_block *sb = journal->j_private;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -1136,6 +1140,9 @@ static int ext4_fc_perform_commit(journal_t *journal)
 		ret = ext4_fc_write_inode(inode, &crc);
 		if (ret)
 			goto out;
+		spin_lock(&sbi->s_fc_lock);
+	}
+	list_for_each_entry(iter, &sbi->s_fc_q[FC_Q_MAIN], i_fc_list) {
 		ext4_clear_inode_state(inode, EXT4_STATE_FC_COMMITTING);
 		/*
 		 * Make sure clearing of EXT4_STATE_FC_COMMITTING is
@@ -1148,7 +1155,6 @@ static int ext4_fc_perform_commit(journal_t *journal)
 #else
 		wake_up_bit(&iter->i_flags, EXT4_STATE_FC_COMMITTING);
 #endif
-		spin_lock(&sbi->s_fc_lock);
 	}
 	spin_unlock(&sbi->s_fc_lock);
 

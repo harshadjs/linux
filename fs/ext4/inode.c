@@ -5470,11 +5470,17 @@ int ext4_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 					(attr->ia_size > 0 ? attr->ia_size - 1 : 0) >>
 					inode->i_sb->s_blocksize_bits);
 
+			/*
+			 * Since we are going to call ext4_mark_inode_dirty with
+			 * i_data_sem held, explicitly call ext4_fc_track_inode
+			 * first.
+			 */
+			ext4_fc_track_inode(handle, inode);
+			down_write(&EXT4_I(inode)->i_data_sem);
+			EXT4_I(inode)->i_disksize = attr->ia_size;
 			rc = ext4_mark_inode_dirty(handle, inode);
 			if (!error)
 				error = rc;
-			down_write(&EXT4_I(inode)->i_data_sem);
-			EXT4_I(inode)->i_disksize = attr->ia_size;
 
 			/*
 			 * We have to update i_size under i_data_sem together
@@ -5757,6 +5763,9 @@ ext4_reserve_inode_write(handle_t *handle, struct inode *inode,
 		ext4_fc_track_inode(handle, inode);
 	}
 	ext4_std_error(inode->i_sb, err);
+	if (err)
+		ext4_fc_mark_ineligible(inode->i_sb, EXT4_FC_REASON_NOMEM, handle);
+
 	return err;
 }
 

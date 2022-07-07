@@ -1500,6 +1500,8 @@ retry:
 			continue;
 		}
 
+		ext4_fc_commit(sbi->s_journal, ei->i_sync_tid);
+
 		if (ei == locked_ei || !write_trylock(&ei->i_es_lock)) {
 			nr_skipped++;
 			continue;
@@ -1574,7 +1576,8 @@ static unsigned long ext4_es_scan(struct shrinker *shrink,
 	ret = percpu_counter_read_positive(&sbi->s_es_stats.es_stats_shk_cnt);
 	trace_ext4_es_shrink_scan_enter(sbi->s_sb, nr_to_scan, ret);
 
-	nr_shrunk = __es_shrink(sbi, nr_to_scan, NULL);
+	//nr_shrunk = __es_shrink(sbi, nr_to_scan, NULL);
+	nr_shrunk = 0;
 
 	ret = percpu_counter_read_positive(&sbi->s_es_stats.es_stats_shk_cnt);
 	trace_ext4_es_shrink_scan_exit(sbi->s_sb, nr_shrunk, ret);

@@ -1433,9 +1433,9 @@ static void destroy_inodecache(void)
 	kmem_cache_destroy(ext4_inode_cachep);
 }
 
-void ext4_clear_inode(struct inode *inode)
+void ext4_clear_inode(handle_t *handle, struct inode *inode)
 {
-	ext4_fc_del(inode);
+	ext4_fc_del(handle, inode);
 	invalidate_inode_buffers(inode);
 	clear_inode(inode);
 	ext4_discard_preallocations(inode, 0);
@@ -5519,7 +5519,7 @@ static int ext4_fill_super(struct super_block *sb, struct fs_context *fc)
 		descr = "out journal";
 
 	if (___ratelimit(&ext4_mount_msg_ratelimit, "EXT4-fs mount"))
-		ext4_msg(sb, KERN_INFO, "mounted filesystem with%s. "
+		ext4_msg(sb, KERN_INFO, "16 mounted filesystem with%s. "
 			 "Quota mode: %s.", descr, ext4_quota_mode(sb));
 
 	/* Update the s_overhead_clusters if necessary */

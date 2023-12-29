@@ -220,7 +220,7 @@ void ext4_fc_init_inode(struct inode *inode)
  * Remove inode from fast commit list. If the inode is being committed
  * we wait until inode commit is done.
  */
-void ext4_fc_del(struct inode *inode)
+void ext4_fc_del(handle_t *handle, struct inode *inode)
 {
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
@@ -251,8 +251,8 @@ void ext4_fc_del(struct inode *inode)
 	 * file system as fast commit ineligible anyway. So, even in that case,
 	 * it is okay to remove the inode from the fc list.
 	 */
-	WARN_ON(ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)
-		&& !ext4_test_mount_flag(inode->i_sb, EXT4_MF_FC_INELIGIBLE));
+	// WARN_ON(ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)
+	// 	&& !ext4_test_mount_flag(inode->i_sb, EXT4_MF_FC_INELIGIBLE));
 	list_del_init(&ei->i_fc_list);
 
 	/*
@@ -568,23 +568,29 @@ __releases(fc_committing_lock)
 	WARN_ON(lockdep_is_held(&ei->i_data_sem));
 #endif
 
-	while (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
+	spin_lock(&sbi->s_fc_lock);
+	while (handle->h_generation == jbd2_get_current_generation(sbi->s_journal) && ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
+		// printk(KERN_ERR "[%p] Waiting with %d handle, %d\n", handle, handle->h_generation, jbd2_get_current_generation(sbi->s_journal));
 #if (BITS_PER_LONG < 64)
 		DEFINE_WAIT_BIT(wait, &ei->i_state_flags,
 				EXT4_STATE_FC_COMMITTING);
 		wq = bit_waitqueue(&ei->i_state_flags,
-				   EXT4_STATE_FC_COMMITTING);
+				EXT4_STATE_FC_COMMITTING);
 #else
 		DEFINE_WAIT_BIT(wait, &ei->i_flags,
 				EXT4_STATE_FC_COMMITTING);
 		wq = bit_waitqueue(&ei->i_flags,
-				   EXT4_STATE_FC_COMMITTING);
+				EXT4_STATE_FC_COMMITTING);
 #endif
 		prepare_to_wait(wq, &wait.wq_entry, TASK_UNINTERRUPTIBLE);
-		if (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING))
-			schedule();
+		// if (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
+		spin_unlock(&sbi->s_fc_lock);
+		schedule();
+		spin_lock(&sbi->s_fc_lock);
 		finish_wait(wq, &wait.wq_entry);
+		// printk(KERN_ERR "Woke with %d handle\n", handle->h_generation);
 	}
+	spin_unlock(&sbi->s_fc_lock);
 
 	ret = ext4_fc_track_template(handle, inode, __track_inode, NULL, 1);
 	trace_ext4_fc_track_inode(handle, inode, ret);
@@ -1081,14 +1087,21 @@ __releases(fc_committing_lock)
 	u32 crc = 0;
 
 	/* Lock the journal */
-	jbd2_journal_lock_updates(journal);
+	// jbd2_journal_lock_updates(journal);
+
+	// T2: new handle opens, generation set to current
+	// T2: skips waiting for committing inode
+
 	spin_lock(&sbi->s_fc_lock);
+	jbd2_increment_generation(journal);
 	list_for_each_entry(iter, &sbi->s_fc_q[FC_Q_MAIN], i_fc_list) {
 		ext4_set_inode_state(&iter->vfs_inode,
 				     EXT4_STATE_FC_COMMITTING);
 	}
 	spin_unlock(&sbi->s_fc_lock);
-	jbd2_journal_unlock_updates(journal);
+	// jbd2_journal_unlock_updates(journal);
+
+	jbd2_wait_old_handles(journal);
 
 	ret = ext4_fc_submit_inode_data_all(journal);
 	if (ret)
@@ -1141,8 +1154,6 @@ __releases(fc_committing_lock)
 		if (ret)
 			goto out;
 		spin_lock(&sbi->s_fc_lock);
-	}
-	list_for_each_entry(iter, &sbi->s_fc_q[FC_Q_MAIN], i_fc_list) {
 		ext4_clear_inode_state(inode, EXT4_STATE_FC_COMMITTING);
 		/*
 		 * Make sure clearing of EXT4_STATE_FC_COMMITTING is

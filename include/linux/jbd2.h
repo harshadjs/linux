@@ -510,6 +510,7 @@ struct jbd2_journal_handle
 	unsigned int		h_requested_credits;
 
 	unsigned int		saved_alloc_context;
+	unsigned int		h_generation;
 };
 
 
@@ -873,6 +874,11 @@ struct journal_s
 	 * @j_wait_updates: Wait queue to wait for updates to complete.
 	 */
 	wait_queue_head_t	j_wait_updates;
+	wait_queue_head_t	j_wait_updates_old;
+	atomic_t		j_updates_old;
+	atomic_t		j_updates_current;
+	atomic_t		j_updates_generation;
+
 
 	/**
 	 * @j_wait_reserved:
@@ -1535,6 +1541,9 @@ extern void	 jbd2_journal_lock_updates (journal_t *);
 extern void	 jbd2_journal_unlock_updates (journal_t *);
 
 void jbd2_journal_wait_updates(journal_t *);
+void jbd2_wait_old_handles(journal_t *);
+void jbd2_increment_generation(journal_t *);
+int jbd2_get_current_generation(journal_t *journal);
 
 extern journal_t * jbd2_journal_init_dev(struct block_device *bdev,
 				struct block_device *fs_dev,

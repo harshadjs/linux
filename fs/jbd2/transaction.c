@@ -33,6 +33,7 @@
 static void __jbd2_journal_temp_unlink_buffer(struct journal_head *jh);
 static void __jbd2_journal_unfile_buffer(struct journal_head *jh);
 
+#define printk(...)
 static struct kmem_cache *transaction_cache;
 int __init jbd2_journal_init_transaction_cache(void)
 {
@@ -451,7 +452,12 @@ repeat:
 	handle->h_requested_credits = blocks;
 	handle->h_revoke_credits_requested = handle->h_revoke_credits;
 	handle->h_start_jiffies = jiffies;
+	handle->h_generation = atomic_read(&journal->j_updates_generation);
 	atomic_inc(&transaction->t_updates);
+	atomic_inc(&journal->j_updates_current);
+	printk(KERN_ERR"[%p]: %d CREATE [old: %d, new: %d]\n",
+		handle, handle->h_generation,
+		atomic_read(&journal->j_updates_old), atomic_read(&journal->j_updates_current));
 	atomic_inc(&transaction->t_handle_count);
 	jbd2_debug(4, "Handle %p given %d credits (total %d, free %lu)\n",
 		  handle, blocks,
@@ -749,6 +755,19 @@ static void stop_this_handle(handle_t *handle)
 						transaction);
 	if (atomic_dec_and_test(&transaction->t_updates))
 		wake_up(&journal->j_wait_updates);
+	read_lock(&journal->j_state_lock);
+	if (handle->h_generation == atomic_read(&journal->j_updates_generation)) {
+		/* new generation handle */
+		atomic_dec_and_test(&journal->j_updates_current);
+	} else {
+		/* new generation handle */
+		if (atomic_dec_and_test(&journal->j_updates_old)) {
+			/* all old updates finished */
+			wake_up(&journal->j_wait_updates_old);
+		}
+	}
+	read_unlock(&journal->j_state_lock);
+
 
 	rwsem_release(&journal->j_trans_commit_map, _THIS_IP_);
 	/*
@@ -863,6 +882,58 @@ void jbd2_journal_wait_updates(journal_t *journal)
 		finish_wait(&journal->j_wait_updates, &wait);
 		write_lock(&journal->j_state_lock);
 	}
+}
+
+void jbd2_increment_generation(journal_t *journal)
+{
+	write_lock(&journal->j_state_lock);
+	atomic_inc(&journal->j_updates_generation);
+	printk(KERN_ERR"new gen = %d\n", atomic_read(&journal->j_updates_generation));
+	atomic_add(atomic_read(&(journal->j_updates_current)), &journal->j_updates_old);
+	atomic_set(&journal->j_updates_current, 0);
+	write_unlock(&journal->j_state_lock);
+}
+
+int jbd2_get_current_generation(journal_t *journal)
+{
+	return atomic_read(&journal->j_updates_generation);
+}
+
+void jbd2_wait_old_handles(journal_t *journal)
+{
+	/* TODO: don't really need old updates? */
+	DEFINE_WAIT(wait);
+	// write_lock(&journal->j_state_lock);
+
+	while (1) {
+		/*
+		 * Note that the running transaction can get freed under us if
+		 * this transaction is getting committed in
+		 * jbd2_journal_commit_transaction() ->
+		 * jbd2_journal_free_transaction(). This can only happen when we
+		 * release j_state_lock -> schedule() -> acquire j_state_lock.
+		 * Hence we should everytime retrieve new j_running_transaction
+		 * value (after j_state_lock release acquire cycle), else it may
+		 * lead to use-after-free of old freed transaction.
+		 */
+		transaction_t *transaction = journal->j_running_transaction;
+
+		if (!transaction)
+			break;
+
+		prepare_to_wait(&journal->j_wait_updates_old, &wait,
+				TASK_UNINTERRUPTIBLE);
+
+		if (atomic_read(&journal->j_updates_old) == 0) {
+			finish_wait(&journal->j_wait_updates_old, &wait);
+			break;				
+		}
+		// write_unlock(&journal->j_state_lock);
+		schedule();
+		finish_wait(&journal->j_wait_updates_old, &wait);
+		// write_lock(&journal->j_state_lock);
+	}
+	// write_unlock(&journal->j_state_lock);
 }
 
 /**

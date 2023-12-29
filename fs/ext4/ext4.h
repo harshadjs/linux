@@ -2879,7 +2879,7 @@ void __ext4_fc_track_create(handle_t *handle, struct inode *inode,
 void ext4_fc_track_create(handle_t *handle, struct dentry *dentry);
 void ext4_fc_track_inode(handle_t *handle, struct inode *inode);
 void ext4_fc_mark_ineligible(struct super_block *sb, int reason, handle_t *handle);
-void ext4_fc_del(struct inode *inode);
+void ext4_fc_del(handle_t *handle, struct inode *inode);
 bool ext4_fc_replay_check_excluded(struct super_block *sb, ext4_fsblk_t block);
 void ext4_fc_replay_cleanup(struct super_block *sb);
 int ext4_fc_commit(journal_t *journal, tid_t commit_tid);
@@ -2969,7 +2969,7 @@ extern int  ext4_setattr(struct user_namespace *, struct dentry *,
 extern int  ext4_getattr(struct user_namespace *, const struct path *,
 			 struct kstat *, u32, unsigned int);
 extern void ext4_evict_inode(struct inode *);
-extern void ext4_clear_inode(struct inode *);
+extern void ext4_clear_inode(handle_t *handle, struct inode *);
 extern int  ext4_file_getattr(struct user_namespace *, const struct path *,
 			      struct kstat *, u32, unsigned int);
 extern int  ext4_sync_inode(handle_t *, struct inode *);

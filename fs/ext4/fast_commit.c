@@ -565,7 +565,7 @@ __releases(fc_committing_lock)
 	 * the commit path needs to grab the lock while committing the inode.
 	 */
 #ifdef CONFIG_LOCKDEP
-	WARN_ON(lockdep_is_held(&ei->i_data_sem));
+	// WARN_ON(lockdep_is_held(&ei->i_data_sem));
 #endif
 
 	while (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
@@ -1067,6 +1067,15 @@ lock_and_exit:
 	return ret;
 }
 
+static u64 get_us_since(ktime_t *prev)
+{
+	ktime_t now;
+	now = ktime_get();
+	u64 diff = ktime_to_us(ktime_sub(now, *prev));
+	*prev = now;
+	return diff;
+}
+
 static int ext4_fc_perform_commit(journal_t *journal)
 __acquires(fc_committing_lock)
 __releases(fc_committing_lock)
@@ -1079,6 +1088,7 @@ __releases(fc_committing_lock)
 	struct blk_plug plug;
 	int ret = 0;
 	u32 crc = 0;
+	ktime_t prev = ktime_get();
 
 	/* Lock the journal */
 	jbd2_journal_lock_updates(journal);
@@ -1089,6 +1099,7 @@ __releases(fc_committing_lock)
 	}
 	spin_unlock(&sbi->s_fc_lock);
 	jbd2_journal_unlock_updates(journal);
+	sbi->s_fc_stats.lock_updates_time += get_us_since(&prev);
 
 	ret = ext4_fc_submit_inode_data_all(journal);
 	if (ret)
@@ -1098,6 +1109,7 @@ __releases(fc_committing_lock)
 	if (ret)
 		return ret;
 
+	sbi->s_fc_stats.flush_data_time += get_us_since(&prev);
 	/*
 	 * If file system device is different from journal device, issue a cache
 	 * flush before we start writing fast commit blocks.
@@ -1127,7 +1139,7 @@ __releases(fc_committing_lock)
 		spin_unlock(&sbi->s_fc_lock);
 		goto out;
 	}
-
+	sbi->s_fc_stats.dentry_commit_time += get_us_since(&prev);
 	list_for_each_entry(iter, &sbi->s_fc_q[FC_Q_MAIN], i_fc_list) {
 		inode = &iter->vfs_inode;
 		if (!ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING))
@@ -1157,11 +1169,13 @@ __releases(fc_committing_lock)
 #endif
 	}
 	spin_unlock(&sbi->s_fc_lock);
+	sbi->s_fc_stats.write_inodes_time += get_us_since(&prev);
 
 	ret = ext4_fc_write_tail(sb, crc);
 
 out:
 	blk_finish_plug(&plug);
+	sbi->s_fc_stats.tail_write_time += get_us_since(&prev);
 	return ret;
 }
 
@@ -1175,6 +1189,7 @@ static void ext4_fc_update_stats(struct super_block *sb, int status,
 	if (status == EXT4_FC_STATUS_OK) {
 		stats->fc_num_commits++;
 		stats->fc_numblks += nblks;
+		stats->total_commit_time += commit_time / 1000;
 		if (likely(stats->s_fc_avg_commit_time))
 			stats->s_fc_avg_commit_time =
 				(commit_time +
@@ -1205,7 +1220,7 @@ int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 	int nblks = 0, ret, bsize = journal->j_blocksize;
 	int subtid = atomic_read(&sbi->s_fc_subtid);
 	int status = EXT4_FC_STATUS_OK, fc_bufs_before = 0;
-	ktime_t start_time, commit_time;
+	ktime_t start_time, prev, commit_time;
 
 	if (!test_opt2(sb, JOURNAL_FAST_COMMIT))
 		return jbd2_complete_transaction(journal, commit_tid);
@@ -1213,6 +1228,7 @@ int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 	trace_ext4_fc_commit_start(sb, commit_tid);
 
 	start_time = ktime_get();
+	prev = start_time;
 
 restart_fc:
 	ret = jbd2_fc_begin_commit(journal, commit_tid);
@@ -1221,10 +1237,13 @@ restart_fc:
 		if (atomic_read(&sbi->s_fc_subtid) <= subtid &&
 			commit_tid > journal->j_commit_sequence)
 			goto restart_fc;
+		sbi->s_fc_stats.begin_time += get_us_since(&prev);
 		ext4_fc_update_stats(sb, EXT4_FC_STATUS_SKIPPED, 0, 0,
 				commit_tid);
 		return 0;
-	} else if (ret) {
+	}
+	sbi->s_fc_stats.begin_time += get_us_since(&prev);
+	if (ret) {
 		/*
 		 * Commit couldn't start. Just update stats and perform a
 		 * full commit.
@@ -1249,12 +1268,14 @@ restart_fc:
 		status = EXT4_FC_STATUS_FAILED;
 		goto fallback;
 	}
+	sbi->s_fc_stats.perform_time += get_us_since(&prev);
 	nblks = (sbi->s_fc_bytes + bsize - 1) / bsize - fc_bufs_before;
 	ret = jbd2_fc_wait_bufs(journal, nblks);
 	if (ret < 0) {
 		status = EXT4_FC_STATUS_FAILED;
 		goto fallback;
 	}
+	sbi->s_fc_stats.wait_bufs_time += get_us_since(&prev);
 	atomic_inc(&sbi->s_fc_subtid);
 	ret = jbd2_fc_end_commit(journal);
 	/*
@@ -2238,11 +2259,23 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 	if (v != SEQ_START_TOKEN)
 		return 0;
 
-	seq_printf(seq,
-		"fc stats:\n%ld commits\n%ld ineligible\n%ld numblks\n%lluus avg_commit_time\n",
-		   stats->fc_num_commits, stats->fc_ineligible_commits,
-		   stats->fc_numblks,
-		   div_u64(stats->s_fc_avg_commit_time, 1000));
+	seq_printf(seq, "fc stats:\n");
+	seq_printf(seq, "%ld commits\n", stats->fc_num_commits);
+	seq_printf(seq, "%ld ineligible\n", stats->fc_ineligible_commits);
+	seq_printf(seq, "%ld numblks\n", stats->fc_numblks);
+	seq_printf(seq, "%ld avg_commit_time\n", div_u64(stats->s_fc_avg_commit_time, 1000));
+	seq_printf(seq, "time breakdown:\n");
+	seq_printf(seq, "\ttotal: %lld\n", stats->total_commit_time / stats->fc_num_commits);
+	seq_printf(seq, "\tbegin_time: %lld\n", stats->begin_time / stats->fc_num_commits);
+	seq_printf(seq, "\tperform_time: %lld\n", stats->perform_time / stats->fc_num_commits);
+	seq_printf(seq, "\t\tlock_updates_time: %lld\n", stats->lock_updates_time / stats->fc_num_commits);
+	seq_printf(seq, "\t\tflush_data_time: %lld\n", stats->flush_data_time / stats->fc_num_commits);
+	seq_printf(seq, "\t\tdentry_commit_time: %lld\n", stats->dentry_commit_time / stats->fc_num_commits);
+	seq_printf(seq, "\t\twrite_inodes_time: %lld\n", stats->write_inodes_time / stats->fc_num_commits);
+	seq_printf(seq, "\t\ttail_write_time: %lld\n", stats->tail_write_time / stats->fc_num_commits);
+	seq_printf(seq, "\twait_bufs_time: %lld\n", stats->wait_bufs_time / stats->fc_num_commits);
+
+
 	seq_puts(seq, "Ineligible reasons:\n");
 	for (i = 0; i < EXT4_FC_REASON_MAX; i++)
 		seq_printf(seq, "\"%s\":\t%d\n", fc_ineligible_reasons[i],

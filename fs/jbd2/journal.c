@@ -1170,19 +1170,19 @@ static int jbd2_seq_info_show(struct seq_file *seq, void *v)
 	if (s->stats->ts_tid == 0)
 		return 0;
 	seq_printf(seq, "average: \n  %ums waiting for transaction\n",
-	    jiffies_to_msecs(s->stats->run.rs_wait / s->stats->ts_tid));
-	seq_printf(seq, "  %ums request delay\n",
+	    jiffies_to_usecs(s->stats->run.rs_wait / s->stats->ts_tid));
+	seq_printf(seq, "  %uus request delay\n",
 	    (s->stats->ts_requested == 0) ? 0 :
-	    jiffies_to_msecs(s->stats->run.rs_request_delay /
+	    jiffies_to_usecs(s->stats->run.rs_request_delay /
 			     s->stats->ts_requested));
-	seq_printf(seq, "  %ums running transaction\n",
-	    jiffies_to_msecs(s->stats->run.rs_running / s->stats->ts_tid));
-	seq_printf(seq, "  %ums transaction was being locked\n",
-	    jiffies_to_msecs(s->stats->run.rs_locked / s->stats->ts_tid));
-	seq_printf(seq, "  %ums flushing data (in ordered mode)\n",
-	    jiffies_to_msecs(s->stats->run.rs_flushing / s->stats->ts_tid));
-	seq_printf(seq, "  %ums logging transaction\n",
-	    jiffies_to_msecs(s->stats->run.rs_logging / s->stats->ts_tid));
+	seq_printf(seq, "  %uus running transaction\n",
+	    jiffies_to_usecs(s->stats->run.rs_running / s->stats->ts_tid));
+	seq_printf(seq, "  %uus transaction was being locked\n",
+	    jiffies_to_usecs(s->stats->run.rs_locked / s->stats->ts_tid));
+	seq_printf(seq, "  %uus flushing data (in ordered mode)\n",
+	    jiffies_to_usecs(s->stats->run.rs_flushing / s->stats->ts_tid));
+	seq_printf(seq, "  %uus logging transaction\n",
+	    jiffies_to_usecs(s->stats->run.rs_logging / s->stats->ts_tid));
 	seq_printf(seq, "  %lluus average transaction commit time\n",
 		   div_u64(s->journal->j_average_commit_time, 1000));
 	seq_printf(seq, "  %lu handles per transaction\n",

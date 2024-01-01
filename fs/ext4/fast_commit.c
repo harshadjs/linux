@@ -1067,15 +1067,6 @@ lock_and_exit:
 	return ret;
 }
 
-static u64 get_us_since(ktime_t *prev)
-{
-	ktime_t now;
-	now = ktime_get();
-	u64 diff = ktime_to_us(ktime_sub(now, *prev));
-	*prev = now;
-	return diff;
-}
-
 static int ext4_fc_perform_commit(journal_t *journal)
 __acquires(fc_committing_lock)
 __releases(fc_committing_lock)
@@ -1091,7 +1082,9 @@ __releases(fc_committing_lock)
 	ktime_t prev = ktime_get();
 
 	/* Lock the journal */
-	jbd2_journal_lock_updates(journal);
+	jbd2_journal_lock_updates_no_rsv(journal);
+	sbi->s_fc_stats.lock_updates_time += get_us_since(&prev);
+
 	spin_lock(&sbi->s_fc_lock);
 	list_for_each_entry(iter, &sbi->s_fc_q[FC_Q_MAIN], i_fc_list) {
 		ext4_set_inode_state(&iter->vfs_inode,
@@ -1099,7 +1092,7 @@ __releases(fc_committing_lock)
 	}
 	spin_unlock(&sbi->s_fc_lock);
 	jbd2_journal_unlock_updates(journal);
-	sbi->s_fc_stats.lock_updates_time += get_us_since(&prev);
+	sbi->s_fc_stats.mark_inodes_committing += get_us_since(&prev);
 
 	ret = ext4_fc_submit_inode_data_all(journal);
 	if (ret)
@@ -1237,7 +1230,6 @@ restart_fc:
 		if (atomic_read(&sbi->s_fc_subtid) <= subtid &&
 			commit_tid > journal->j_commit_sequence)
 			goto restart_fc;
-		sbi->s_fc_stats.begin_time += get_us_since(&prev);
 		ext4_fc_update_stats(sb, EXT4_FC_STATUS_SKIPPED, 0, 0,
 				commit_tid);
 		return 0;
@@ -2260,20 +2252,21 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 		return 0;
 
 	seq_printf(seq, "fc stats:\n");
-	seq_printf(seq, "%ld commits\n", stats->fc_num_commits);
+	seq_printf(seq, "%ld commits (%ld skipped)\n", stats->fc_num_commits, stats->fc_skipped_commits);
 	seq_printf(seq, "%ld ineligible\n", stats->fc_ineligible_commits);
 	seq_printf(seq, "%ld numblks\n", stats->fc_numblks);
 	seq_printf(seq, "%ld avg_commit_time\n", div_u64(stats->s_fc_avg_commit_time, 1000));
 	seq_printf(seq, "time breakdown:\n");
-	seq_printf(seq, "\ttotal: %lld\n", stats->total_commit_time / stats->fc_num_commits);
-	seq_printf(seq, "\tbegin_time: %lld\n", stats->begin_time / stats->fc_num_commits);
-	seq_printf(seq, "\tperform_time: %lld\n", stats->perform_time / stats->fc_num_commits);
-	seq_printf(seq, "\t\tlock_updates_time: %lld\n", stats->lock_updates_time / stats->fc_num_commits);
-	seq_printf(seq, "\t\tflush_data_time: %lld\n", stats->flush_data_time / stats->fc_num_commits);
-	seq_printf(seq, "\t\tdentry_commit_time: %lld\n", stats->dentry_commit_time / stats->fc_num_commits);
-	seq_printf(seq, "\t\twrite_inodes_time: %lld\n", stats->write_inodes_time / stats->fc_num_commits);
-	seq_printf(seq, "\t\ttail_write_time: %lld\n", stats->tail_write_time / stats->fc_num_commits);
-	seq_printf(seq, "\twait_bufs_time: %lld\n", stats->wait_bufs_time / stats->fc_num_commits);
+	seq_printf(seq, "\ttotal: %lld\n", stats->total_commit_time);
+	seq_printf(seq, "\tbegin_time: %lld\n", stats->begin_time);
+	seq_printf(seq, "\tperform_time: %lld\n", stats->perform_time);
+	seq_printf(seq, "\t\tlock_updates_time: %lld\n", stats->lock_updates_time);
+	seq_printf(seq, "\t\tmark_inodes_committing: %lld\n", stats->mark_inodes_committing);
+	seq_printf(seq, "\t\tflush_data_time: %lld\n", stats->flush_data_time);
+	seq_printf(seq, "\t\tdentry_commit_time: %lld\n", stats->dentry_commit_time);
+	seq_printf(seq, "\t\twrite_inodes_time: %lld\n", stats->write_inodes_time);
+	seq_printf(seq, "\t\ttail_write_time: %lld\n", stats->tail_write_time);
+	seq_printf(seq, "\twait_bufs_time: %lld\n", stats->wait_bufs_time);
 
 
 	seq_puts(seq, "Ineligible reasons:\n");

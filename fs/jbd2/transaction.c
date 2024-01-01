@@ -904,6 +904,28 @@ void jbd2_journal_lock_updates(journal_t *journal)
 	mutex_lock(&journal->j_barrier);
 }
 
+
+void jbd2_journal_lock_updates_no_rsv(journal_t *journal)
+{
+	jbd2_might_wait_for_commit(journal);
+
+	write_lock(&journal->j_state_lock);
+	++journal->j_barrier_count;
+
+	/* Wait until there are no running t_updates */
+	jbd2_journal_wait_updates(journal);
+
+	write_unlock(&journal->j_state_lock);
+
+	/*
+	 * We have now established a barrier against other normal updates, but
+	 * we also need to barrier against other jbd2_journal_lock_updates() calls
+	 * to make sure that we serialise special journal-locked operations
+	 * too.
+	 */
+	mutex_lock(&journal->j_barrier);
+}
+
 /**
  * jbd2_journal_unlock_updates () - release barrier
  * @journal:  Journal to release the barrier on.

@@ -663,7 +663,7 @@ struct transaction_s
 	/*
 	 * When commit was requested [j_state_lock]
 	 */
-	unsigned long		t_requested;
+	u64		t_requested;
 
 	/*
 	 * Checkpointing stats [j_list_lock]
@@ -754,6 +754,16 @@ jbd2_time_diff(unsigned long start, unsigned long end)
 		return end - start;
 
 	return end + (MAX_JIFFY_OFFSET - start);
+}
+
+static inline u64 get_us_since(ktime_t *prev)
+{
+	ktime_t now;
+	u64 diff;
+	now = ktime_get();
+	diff = ktime_to_us(ktime_sub(now, *prev));
+	*prev = now;
+	return diff;
 }
 
 #define JBD2_NR_BATCH	64
@@ -1308,6 +1318,9 @@ struct journal_s
 				    struct buffer_head *bh,
 				    enum passtype pass, int off,
 				    tid_t expected_commit_id);
+	u64 j_complete_tx_time;
+	u64 j_total_tx;
+	
 };
 
 #define jbd2_might_wait_for_commit(j) \
@@ -1532,6 +1545,7 @@ bool jbd2_journal_try_to_free_buffers(journal_t *journal, struct folio *folio);
 extern int	 jbd2_journal_stop(handle_t *);
 extern int	 jbd2_journal_flush(journal_t *journal, unsigned int flags);
 extern void	 jbd2_journal_lock_updates (journal_t *);
+void jbd2_journal_lock_updates_no_rsv(journal_t *journal);
 extern void	 jbd2_journal_unlock_updates (journal_t *);
 
 void jbd2_journal_wait_updates(journal_t *);

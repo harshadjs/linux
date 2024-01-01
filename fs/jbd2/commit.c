@@ -410,7 +410,9 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 	int csum_size = 0;
 	LIST_HEAD(io_bufs);
 	LIST_HEAD(log_bufs);
+	ktime_t prev;
 
+	prev = ktime_get();
 	if (jbd2_journal_has_csum_v2or3(journal))
 		csum_size = sizeof(struct jbd2_journal_block_tail);
 
@@ -481,8 +483,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 	stats.run.rs_locked = jiffies;
 	if (commit_transaction->t_requested)
 		stats.run.rs_request_delay =
-			jbd2_time_diff(commit_transaction->t_requested,
-				       stats.run.rs_locked);
+			ktime_to_us(ktime_sub(ktime_get(), commit_transaction->t_requested));
 	stats.run.rs_running = jbd2_time_diff(commit_transaction->t_start,
 					      stats.run.rs_locked);
 
@@ -561,9 +562,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 		   &commit_transaction->t_outstanding_credits);
 
 	trace_jbd2_commit_flushing(journal, commit_transaction);
-	stats.run.rs_flushing = jiffies;
-	stats.run.rs_locked = jbd2_time_diff(stats.run.rs_locked,
-					     stats.run.rs_flushing);
+	stats.run.rs_locked = get_us_since(&prev);
 
 	commit_transaction->t_state = T_FLUSH;
 	journal->j_committing_transaction = commit_transaction;
@@ -598,9 +597,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 	write_unlock(&journal->j_state_lock);
 
 	trace_jbd2_commit_logging(journal, commit_transaction);
-	stats.run.rs_logging = jiffies;
-	stats.run.rs_flushing = jbd2_time_diff(stats.run.rs_flushing,
-					       stats.run.rs_logging);
+	stats.run.rs_flushing = get_us_since(&prev);
 	stats.run.rs_blocks = commit_transaction->t_nr_buffers;
 	stats.run.rs_blocks_logged = 0;
 
@@ -1127,8 +1124,7 @@ restart_loop:
 	J_ASSERT(commit_transaction->t_state == T_COMMIT_JFLUSH);
 
 	commit_transaction->t_start = jiffies;
-	stats.run.rs_logging = jbd2_time_diff(stats.run.rs_logging,
-					      commit_transaction->t_start);
+	stats.run.rs_logging = get_us_since(&prev);
 
 	/*
 	 * File the transaction statistics

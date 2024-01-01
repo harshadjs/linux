@@ -120,6 +120,7 @@ struct ext4_fc_stats {
 	unsigned long fc_numblks;
 	u64 s_fc_avg_commit_time;
 	u64 lock_updates_time;
+	u64 mark_inodes_committing;
 	u64 flush_data_time;
 	u64 dentry_commit_time;
 	u64 write_inodes_time;

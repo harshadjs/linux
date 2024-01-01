@@ -500,7 +500,7 @@ static int __jbd2_log_start_commit(journal_t *journal, tid_t target)
 		jbd2_debug(1, "JBD2: requesting commit %u/%u\n",
 			  journal->j_commit_request,
 			  journal->j_commit_sequence);
-		journal->j_running_transaction->t_requested = jiffies;
+		journal->j_running_transaction->t_requested = ktime_get();
 		wake_up(&journal->j_wait_commit);
 		return 1;
 	} else if (!tid_geq(journal->j_commit_request, target))
@@ -822,7 +822,9 @@ EXPORT_SYMBOL(jbd2_transaction_committed);
  */
 int jbd2_complete_transaction(journal_t *journal, tid_t tid)
 {
-	int	need_to_wait = 1;
+	int	need_to_wait = 1, ret, requested = 0;
+	ktime_t prev;
+	prev = ktime_get();
 
 	read_lock(&journal->j_state_lock);
 	if (journal->j_running_transaction &&
@@ -831,16 +833,22 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
 			/* transaction not yet started, so request it */
 			read_unlock(&journal->j_state_lock);
 			jbd2_log_start_commit(journal, tid);
+			requested = 1;
 			goto wait_commit;
 		}
 	} else if (!(journal->j_committing_transaction &&
 		     journal->j_committing_transaction->t_tid == tid))
 		need_to_wait = 0;
 	read_unlock(&journal->j_state_lock);
-	if (!need_to_wait)
+	if (!need_to_wait) {
+		journal->j_complete_tx_time += get_us_since(&prev);
 		return 0;
+	}
 wait_commit:
-	return jbd2_log_wait_commit(journal, tid);
+	ret = jbd2_log_wait_commit(journal, tid);
+	if (requested)
+		journal->j_complete_tx_time += get_us_since(&prev);
+	return ret;
 }
 EXPORT_SYMBOL(jbd2_complete_transaction);
 
@@ -1169,20 +1177,19 @@ static int jbd2_seq_info_show(struct seq_file *seq, void *v)
 		   s->journal->j_max_transaction_buffers);
 	if (s->stats->ts_tid == 0)
 		return 0;
-	seq_printf(seq, "average: \n  %ums waiting for transaction\n",
-	    jiffies_to_usecs(s->stats->run.rs_wait / s->stats->ts_tid));
-	seq_printf(seq, "  %uus request delay\n",
+	seq_printf(seq, "total: \n  %lums waiting for transaction\n",
+	    s->stats->run.rs_wait / s->stats->ts_tid);
+	seq_printf(seq, "  %luus request delay\n",
 	    (s->stats->ts_requested == 0) ? 0 :
-	    jiffies_to_usecs(s->stats->run.rs_request_delay /
-			     s->stats->ts_requested));
-	seq_printf(seq, "  %uus running transaction\n",
-	    jiffies_to_usecs(s->stats->run.rs_running / s->stats->ts_tid));
-	seq_printf(seq, "  %uus transaction was being locked\n",
-	    jiffies_to_usecs(s->stats->run.rs_locked / s->stats->ts_tid));
-	seq_printf(seq, "  %uus flushing data (in ordered mode)\n",
-	    jiffies_to_usecs(s->stats->run.rs_flushing / s->stats->ts_tid));
-	seq_printf(seq, "  %uus logging transaction\n",
-	    jiffies_to_usecs(s->stats->run.rs_logging / s->stats->ts_tid));
+	    s->stats->run.rs_request_delay);
+	seq_printf(seq, "  %luus running transaction\n",
+	    s->stats->run.rs_running);
+	seq_printf(seq, "  %luus transaction was being locked\n",
+	    s->stats->run.rs_locked );
+	seq_printf(seq, "  %luus flushing data (in ordered mode)\n",
+	    s->stats->run.rs_flushing);
+	seq_printf(seq, "  %luus logging transaction\n",
+	    s->stats->run.rs_logging);
 	seq_printf(seq, "  %lluus average transaction commit time\n",
 		   div_u64(s->journal->j_average_commit_time, 1000));
 	seq_printf(seq, "  %lu handles per transaction\n",
@@ -1191,6 +1198,8 @@ static int jbd2_seq_info_show(struct seq_file *seq, void *v)
 	    s->stats->run.rs_blocks / s->stats->ts_tid);
 	seq_printf(seq, "  %lu logged blocks per transaction\n",
 	    s->stats->run.rs_blocks_logged / s->stats->ts_tid);
+	seq_printf(seq, "  %lld actual time\n", s->journal->j_complete_tx_time);
+
 	return 0;
 }
 

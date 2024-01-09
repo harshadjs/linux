@@ -26,6 +26,9 @@
 #include <linux/bitops.h>
 #include <trace/events/jbd2.h>
 
+
+// ktime_t jthread_wakes_up;
+// ktime_t commit_done;
 /*
  * IO end handler for temporary buffer_heads handling writes to the journal.
  */
@@ -1176,6 +1179,8 @@ restart_loop:
 	}
 	spin_unlock(&journal->j_list_lock);
 	write_unlock(&journal->j_state_lock);
+	// if (jbd2_has_feature_fast_commit(journal))
+	// 	commit_done = ktime_get();
 	wake_up(&journal->j_wait_done_commit);
 	wake_up(&journal->j_fc_wait);
 

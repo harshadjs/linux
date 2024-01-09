@@ -10,6 +10,7 @@
 #include "ext4.h"
 #include "ext4_jbd2.h"
 #include "ext4_extents.h"
+#include "extents_status.h"
 #include "mballoc.h"
 
 /*
@@ -176,6 +177,11 @@
  *    status tree. This would get rid of the need to call ext4_fc_track_inode()
  *    before acquiring i_data_sem. To do that we would need to ensure that
  *    modified extents from the extent status tree are not evicted from memory.
+
+dev=vdb; dmesg -c > /dev/null; mkfs.ext4 -O fast_commit /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ; umount /mnt
+dev=vdb; dmesg -c > /dev/null; mkfs.ext4 -O fast_commit /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ; umount /mnt
+
+
  */
 
 #include <trace/events/ext4.h>
@@ -649,15 +655,33 @@ static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail)
 {
 	int write_flags = REQ_SYNC;
 	struct buffer_head *bh = EXT4_SB(sb)->s_fc_bh;
+	static int x = 0;
 
+	if (!is_tail) {
+		// non-tail
+		x = 1;
+	} else {
+		// tail
+		if (x == 1) {
+			// dont do fua
+			if (test_opt(sb, BARRIER))
+				write_flags |= REQ_PREFLUSH;
+		} else {
+			// do fua
+			if (test_opt(sb, BARRIER))
+				write_flags |= REQ_FUA | REQ_PREFLUSH;
+		}
+		x = 0;
+	}
 	/* Add REQ_FUA | REQ_PREFLUSH only its tail */
-	if (test_opt(sb, BARRIER) && is_tail)
-		write_flags |= REQ_FUA | REQ_PREFLUSH;
+	// if (test_opt(sb, BARRIER) && is_tail)
+	// 	write_flags |= REQ_FUA | REQ_PREFLUSH;
 	lock_buffer(bh);
 	set_buffer_dirty(bh);
 	set_buffer_uptodate(bh);
 	bh->b_end_io = ext4_end_buffer_io_sync;
 	submit_bh(REQ_OP_WRITE, write_flags, bh);
+	EXT4_SB(sb)->s_fc_stats.real_numblks++;
 	EXT4_SB(sb)->s_fc_bh = NULL;
 }
 
@@ -1031,7 +1055,9 @@ __releases(&sbi->s_fc_lock)
 		 * With fcd_dilist we need not loop in sbi->s_fc_q to get the
 		 * corresponding inode pointer
 		 */
-		WARN_ON(list_empty(&fc_dentry->fcd_dilist));
+		// WARN_ON(list_empty(&fc_dentry->fcd_dilist));
+		// if (list_empty(&fc_dentry->fcd_dilist))
+		// 	continue;
 		ei = list_first_entry(&fc_dentry->fcd_dilist,
 				struct ext4_inode_info, i_fc_dilist);
 		inode = &ei->vfs_inode;
@@ -1206,7 +1232,7 @@ static void ext4_fc_update_stats(struct super_block *sb, int status,
  * due to various reasons, we fall back to full commit. Returns 0
  * on success, error otherwise.
  */
-int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
+int __ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 {
 	struct super_block *sb = journal->j_private;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -1214,6 +1240,7 @@ int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 	int subtid = atomic_read(&sbi->s_fc_subtid);
 	int status = EXT4_FC_STATUS_OK, fc_bufs_before = 0;
 	ktime_t start_time, prev, commit_time;
+	int old_ioprio;
 
 	if (!test_opt2(sb, JOURNAL_FAST_COMMIT))
 		return jbd2_complete_transaction(journal, commit_tid);
@@ -1253,7 +1280,8 @@ restart_fc:
 		status = EXT4_FC_STATUS_INELIGIBLE;
 		goto fallback;
 	}
-
+	old_ioprio = get_current_ioprio();
+	set_task_ioprio(current, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 3));
 	fc_bufs_before = (sbi->s_fc_bytes + bsize - 1) / bsize;
 	ret = ext4_fc_perform_commit(journal);
 	if (ret < 0) {
@@ -1270,6 +1298,7 @@ restart_fc:
 	sbi->s_fc_stats.wait_bufs_time += get_us_since(&prev);
 	atomic_inc(&sbi->s_fc_subtid);
 	ret = jbd2_fc_end_commit(journal);
+	set_task_ioprio(current, old_ioprio);
 	/*
 	 * weight the commit time higher than the average time so we
 	 * don't react too strongly to vast changes in the commit time
@@ -1279,8 +1308,18 @@ restart_fc:
 	return ret;
 
 fallback:
+	set_task_ioprio(current, old_ioprio);
 	ret = jbd2_fc_end_commit_fallback(journal);
 	ext4_fc_update_stats(sb, status, 0, 0, commit_tid);
+	return ret;
+}
+
+int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
+{
+	int ret;
+	// ktime_t start_time = ktime_get();
+	ret = __ext4_fc_commit(journal, commit_tid);
+	// printk(KERN_ERR "TOTAL: %lld\n", ktime_to_us(ktime_sub(ktime_get(), start_time)));
 	return ret;
 }
 
@@ -2255,6 +2294,7 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "%ld commits (%ld skipped)\n", stats->fc_num_commits, stats->fc_skipped_commits);
 	seq_printf(seq, "%ld ineligible\n", stats->fc_ineligible_commits);
 	seq_printf(seq, "%ld numblks\n", stats->fc_numblks);
+	seq_printf(seq, "%ld real_numblks\n", stats->real_numblks);
 	seq_printf(seq, "%ld avg_commit_time\n", div_u64(stats->s_fc_avg_commit_time, 1000));
 	seq_printf(seq, "time breakdown:\n");
 	seq_printf(seq, "\ttotal: %lld\n", stats->total_commit_time);

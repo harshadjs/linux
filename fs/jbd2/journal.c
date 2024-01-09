@@ -98,6 +98,9 @@ EXPORT_SYMBOL(jbd2_inode_cache);
 
 static int jbd2_journal_create_slab(size_t slab_size);
 
+// extern ktime_t jthread_wakes_up;
+// extern ktime_t commit_done;
+
 #ifdef CONFIG_JBD2_DEBUG
 void __jbd2_debug(int level, const char *file, const char *func,
 		  unsigned int line, const char *fmt, ...)
@@ -248,6 +251,8 @@ loop:
 		}
 		finish_wait(&journal->j_wait_commit, &wait);
 	}
+	// if (jbd2_has_feature_fast_commit(journal))
+	// 	jthread_wakes_up = ktime_get();
 
 	jbd2_debug(1, "kjournald2 wakes\n");
 
@@ -823,7 +828,7 @@ EXPORT_SYMBOL(jbd2_transaction_committed);
 int jbd2_complete_transaction(journal_t *journal, tid_t tid)
 {
 	int	need_to_wait = 1, ret, requested = 0;
-	ktime_t prev;
+	ktime_t prev;//, requested_time;
 	prev = ktime_get();
 
 	read_lock(&journal->j_state_lock);
@@ -832,6 +837,7 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
 		if (journal->j_commit_request != tid) {
 			/* transaction not yet started, so request it */
 			read_unlock(&journal->j_state_lock);
+			// requested_time = ktime_get();
 			jbd2_log_start_commit(journal, tid);
 			requested = 1;
 			goto wait_commit;
@@ -846,6 +852,12 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
 	}
 wait_commit:
 	ret = jbd2_log_wait_commit(journal, tid);
+	// if (requested && jbd2_has_feature_fast_commit(journal)) {
+	// 	printk(KERN_ERR "fsync -> journal: %lld\n",
+	// 		ktime_to_ns(ktime_sub(jthread_wakes_up, requested_time)));
+	// 	printk(KERN_ERR "journal -> fsync: %lld\n",
+	// 		ktime_to_ns(ktime_sub(ktime_get(), commit_done)));
+	// }
 	if (requested)
 		journal->j_complete_tx_time += get_us_since(&prev);
 	return ret;

@@ -273,7 +273,7 @@ TRACE_EVENT(jbd2_run_stats,
 		__entry->running	= stats->rs_running;
 		__entry->locked		= stats->rs_locked;
 		__entry->flushing	= stats->rs_flushing;
-		__entry->logging	= stats->rs_logging;
+		__entry->logging	= stats->rs_logging_1;
 		__entry->handle_count	= stats->rs_handle_count;
 		__entry->blocks		= stats->rs_blocks;
 		__entry->blocks_logged	= stats->rs_blocks_logged;

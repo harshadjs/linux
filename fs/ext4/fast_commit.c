@@ -179,7 +179,10 @@
  *    modified extents from the extent status tree are not evicted from memory.
 
 dev=vdb; dmesg -c > /dev/null; mkfs.ext4 -O fast_commit /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ; umount /mnt
-dev=vdb; dmesg -c > /dev/null; mkfs.ext4 -O fast_commit /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ; umount /mnt
+dev=vdb; dmesg -c > /dev/null; mkfs.ext4 /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; time sync /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ;  cat /proc/fs/ext4/${dev}/fc_info; umount /mnt
+dev=nvme0n1p1; dmesg -c > /dev/null; mkfs.ext4 /dev/$dev; mount /dev/$dev /mnt; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ; umount /mnt
+dev=nvme0n1p1; dmesg -c > /dev/null; mkfs.ext4 -O fast_commit /dev/$dev; mount /dev/$dev /mnt; touch /mnt/m; sync; echo t > /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/ext4/nvme0n1p1/fc_info ; umount /mnt
+dev=vdb; dmesg -c > /dev/null; mkfs.ext4 /dev/$dev; mount /dev/$dev  -O journal_async_commit /mnt; echo t > /mnt/t; time sync /mnt/t; time sync /mnt/t; time sync /mnt/t; dmesg -c; cat /proc/fs/jbd2/${dev}-8/info ;  umount /mnt
 
 
  */
@@ -651,27 +654,32 @@ void ext4_fc_track_range(handle_t *handle, struct inode *inode, ext4_lblk_t star
 	trace_ext4_fc_track_range(handle, inode, start, end, ret);
 }
 
-static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail)
+static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail, int needs_flush)
 {
 	int write_flags = REQ_SYNC;
 	struct buffer_head *bh = EXT4_SB(sb)->s_fc_bh;
-	static int x = 0;
+	static int fua_ineligible = 0;
 
 	if (!is_tail) {
-		// non-tail
-		x = 1;
+		// current is non-tail
+		fua_ineligible = 1;
 	} else {
-		// tail
-		if (x == 1) {
+		// current is tail
+		if (fua_ineligible == 1) {
+			// there was at least one non-tail block.
 			// dont do fua
-			if (test_opt(sb, BARRIER))
+			if (test_opt(sb, BARRIER)) {
+				// in this case we need a flush.
 				write_flags |= REQ_PREFLUSH;
+			}
 		} else {
 			// do fua
 			if (test_opt(sb, BARRIER))
-				write_flags |= REQ_FUA | REQ_PREFLUSH;
+				write_flags |= REQ_FUA;
+			if (needs_flush)
+				write_flags |= REQ_PREFLUSH;
 		}
-		x = 0;
+		fua_ineligible = 0;
 	}
 	/* Add REQ_FUA | REQ_PREFLUSH only its tail */
 	// if (test_opt(sb, BARRIER) && is_tail)
@@ -682,6 +690,8 @@ static void ext4_fc_submit_bh(struct super_block *sb, bool is_tail)
 	bh->b_end_io = ext4_end_buffer_io_sync;
 	submit_bh(REQ_OP_WRITE, write_flags, bh);
 	EXT4_SB(sb)->s_fc_stats.real_numblks++;
+	if (write_flags & REQ_PREFLUSH)
+		EXT4_SB(sb)->s_fc_stats.num_flushes++;
 	EXT4_SB(sb)->s_fc_bh = NULL;
 }
 
@@ -749,7 +759,7 @@ static u8 *ext4_fc_reserve_space(struct super_block *sb, int len, u32 *crc)
 		*crc = ext4_chksum(sbi, *crc, tl, sizeof(*tl));
 	if (pad_len > 0)
 		ext4_fc_memzero(sb, tl + 1, pad_len, crc);
-	ext4_fc_submit_bh(sb, false);
+	ext4_fc_submit_bh(sb, false, false);
 
 	ret = jbd2_fc_get_buf(EXT4_SB(sb)->s_journal, &bh);
 	if (ret)
@@ -776,7 +786,7 @@ static void *ext4_fc_memcpy(struct super_block *sb, void *dst, const void *src,
  * in the block, next commit shouldn't use it. That's why tail tag
  * has the length as that of the remaining space on the block.
  */
-static int ext4_fc_write_tail(struct super_block *sb, u32 crc)
+static int ext4_fc_write_tail(struct super_block *sb, u32 crc, int needs_flush)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_fc_tl tl;
@@ -806,7 +816,7 @@ static int ext4_fc_write_tail(struct super_block *sb, u32 crc)
 	tail.fc_crc = cpu_to_le32(crc);
 	ext4_fc_memcpy(sb, dst, &tail.fc_crc, sizeof(tail.fc_crc), NULL);
 
-	ext4_fc_submit_bh(sb, true);
+	ext4_fc_submit_bh(sb, true, needs_flush);
 
 	return 0;
 }
@@ -858,6 +868,11 @@ static bool ext4_fc_add_dentry_tlv(struct super_block *sb, u32 *crc,
 	ext4_fc_memcpy(sb, dst, fc_dentry->fcd_name.name, dlen, crc);
 
 	return true;
+}
+
+void ext4_fc_mark_needs_flush(struct super_block *sb)
+{
+	EXT4_SB(sb)->fc_flush_required = 1;
 }
 
 /*
@@ -936,7 +951,7 @@ static int ext4_fc_write_inode_data(struct inode *inode, u32 *crc)
 	while (cur_lblk_off <= new_blk_size) {
 		map.m_lblk = cur_lblk_off;
 		map.m_len = new_blk_size - cur_lblk_off + 1;
-		ret = ext4_map_blocks(NULL, inode, &map, EXT4_GET_BLOCKS_CACHED_NOWAIT);
+		ret = ext4_map_blocks(NULL, inode, &map, EXT4_GET_BLOCKS_NOLOCK);
 		if (ret < 0)
 			return -ECANCELED;
 
@@ -1027,7 +1042,7 @@ static int ext4_fc_wait_inode_data_all(journal_t *journal)
 }
 
 /* Commit all the directory entry updates */
-static int ext4_fc_commit_dentry_updates(journal_t *journal, u32 *crc)
+static int ext4_fc_commit_dentry_updates(journal_t *journal, u32 *crc, int *work_done)
 __acquires(&sbi->s_fc_lock)
 __releases(&sbi->s_fc_lock)
 {
@@ -1042,6 +1057,7 @@ __releases(&sbi->s_fc_lock)
 		return 0;
 	list_for_each_entry_safe(fc_dentry, fc_dentry_n,
 				 &sbi->s_fc_dentry_q[FC_Q_MAIN], fcd_list) {
+		*work_done = 1;
 		if (fc_dentry->fcd_op != EXT4_FC_TAG_CREAT) {
 			spin_unlock(&sbi->s_fc_lock);
 			if (!ext4_fc_add_dentry_tlv(sb, crc, fc_dentry)) {
@@ -1093,7 +1109,7 @@ lock_and_exit:
 	return ret;
 }
 
-static int ext4_fc_perform_commit(journal_t *journal)
+static int ext4_fc_perform_commit(journal_t *journal, int *work_done, int *flush)
 __acquires(fc_committing_lock)
 __releases(fc_committing_lock)
 {
@@ -1117,23 +1133,27 @@ __releases(fc_committing_lock)
 				     EXT4_STATE_FC_COMMITTING);
 	}
 	spin_unlock(&sbi->s_fc_lock);
+	*flush = sbi->fc_flush_required;
+	sbi->fc_flush_required = 0;
 	jbd2_journal_unlock_updates(journal);
 	sbi->s_fc_stats.mark_inodes_committing += get_us_since(&prev);
 
-	ret = ext4_fc_submit_inode_data_all(journal);
-	if (ret)
-		return ret;
+	if (*flush) {
+		ret = ext4_fc_submit_inode_data_all(journal);
+		if (ret)
+			return ret;
 
-	ret = ext4_fc_wait_inode_data_all(journal);
-	if (ret)
-		return ret;
+		ret = ext4_fc_wait_inode_data_all(journal);
+		if (ret)
+			return ret;
+	}
 
 	sbi->s_fc_stats.flush_data_time += get_us_since(&prev);
 	/*
 	 * If file system device is different from journal device, issue a cache
 	 * flush before we start writing fast commit blocks.
 	 */
-	if (journal->j_fs_dev != journal->j_dev)
+	if (*flush && journal->j_fs_dev != journal->j_dev)
 		blkdev_issue_flush(journal->j_fs_dev);
 
 	blk_start_plug(&plug);
@@ -1153,7 +1173,7 @@ __releases(fc_committing_lock)
 	}
 
 	spin_lock(&sbi->s_fc_lock);
-	ret = ext4_fc_commit_dentry_updates(journal, &crc);
+	ret = ext4_fc_commit_dentry_updates(journal, &crc, work_done);
 	if (ret) {
 		spin_unlock(&sbi->s_fc_lock);
 		goto out;
@@ -1163,7 +1183,7 @@ __releases(fc_committing_lock)
 		inode = &iter->vfs_inode;
 		if (!ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING))
 			continue;
-
+		*work_done = 1;
 		spin_unlock(&sbi->s_fc_lock);
 		ret = ext4_fc_write_inode_data(inode, &crc);
 		if (ret)
@@ -1190,7 +1210,12 @@ __releases(fc_committing_lock)
 	spin_unlock(&sbi->s_fc_lock);
 	sbi->s_fc_stats.write_inodes_time += get_us_since(&prev);
 
-	ret = ext4_fc_write_tail(sb, crc);
+	if (*work_done)
+		ret = ext4_fc_write_tail(sb, crc, *flush);
+	else {
+		sbi->s_fc_stats.empty_commits++;
+		ret = 0;
+	}
 
 out:
 	blk_finish_plug(&plug);
@@ -1199,12 +1224,20 @@ out:
 }
 
 static void ext4_fc_update_stats(struct super_block *sb, int status,
-				 u64 commit_time, int nblks, tid_t commit_tid)
+				 u64 commit_time, int nblks, int flush, tid_t commit_tid)
 {
 	struct ext4_fc_stats *stats = &EXT4_SB(sb)->s_fc_stats;
 
 	ext4_debug("Fast commit ended with status = %d for tid %u",
 			status, commit_tid);
+	if (nblks == 1) {
+		if (flush)
+			stats->single_block_flush++;
+		else
+			stats->single_block_fua++;
+	} else if (nblks > 1) {
+		stats->multiblock++;
+	}
 	if (status == EXT4_FC_STATUS_OK) {
 		stats->fc_num_commits++;
 		stats->fc_numblks += nblks;
@@ -1241,6 +1274,7 @@ int __ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 	int status = EXT4_FC_STATUS_OK, fc_bufs_before = 0;
 	ktime_t start_time, prev, commit_time;
 	int old_ioprio;
+	int work_done, flush;
 
 	if (!test_opt2(sb, JOURNAL_FAST_COMMIT))
 		return jbd2_complete_transaction(journal, commit_tid);
@@ -1257,7 +1291,7 @@ restart_fc:
 		if (atomic_read(&sbi->s_fc_subtid) <= subtid &&
 			commit_tid > journal->j_commit_sequence)
 			goto restart_fc;
-		ext4_fc_update_stats(sb, EXT4_FC_STATUS_SKIPPED, 0, 0,
+		ext4_fc_update_stats(sb, EXT4_FC_STATUS_SKIPPED, 0, 0, 0,
 				commit_tid);
 		return 0;
 	}
@@ -1267,7 +1301,7 @@ restart_fc:
 		 * Commit couldn't start. Just update stats and perform a
 		 * full commit.
 		 */
-		ext4_fc_update_stats(sb, EXT4_FC_STATUS_FAILED, 0, 0,
+		ext4_fc_update_stats(sb, EXT4_FC_STATUS_FAILED, 0, 0, 0,
 				commit_tid);
 		return jbd2_complete_transaction(journal, commit_tid);
 	}
@@ -1283,17 +1317,22 @@ restart_fc:
 	old_ioprio = get_current_ioprio();
 	set_task_ioprio(current, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 3));
 	fc_bufs_before = (sbi->s_fc_bytes + bsize - 1) / bsize;
-	ret = ext4_fc_perform_commit(journal);
+	ret = ext4_fc_perform_commit(journal, &work_done, &flush);
 	if (ret < 0) {
 		status = EXT4_FC_STATUS_FAILED;
 		goto fallback;
 	}
 	sbi->s_fc_stats.perform_time += get_us_since(&prev);
 	nblks = (sbi->s_fc_bytes + bsize - 1) / bsize - fc_bufs_before;
-	ret = jbd2_fc_wait_bufs(journal, nblks);
-	if (ret < 0) {
-		status = EXT4_FC_STATUS_FAILED;
-		goto fallback;
+
+	if (work_done) {
+		ret = jbd2_fc_wait_bufs(journal, nblks);
+		if (ret < 0) {
+			status = EXT4_FC_STATUS_FAILED;
+			goto fallback;
+		}
+	} else {
+		ret = 0;
 	}
 	sbi->s_fc_stats.wait_bufs_time += get_us_since(&prev);
 	atomic_inc(&sbi->s_fc_subtid);
@@ -1304,22 +1343,29 @@ restart_fc:
 	 * don't react too strongly to vast changes in the commit time
 	 */
 	commit_time = ktime_to_ns(ktime_sub(ktime_get(), start_time));
-	ext4_fc_update_stats(sb, status, commit_time, nblks, commit_tid);
+	ext4_fc_update_stats(sb, status, commit_time, nblks, flush, commit_tid);
 	return ret;
 
 fallback:
 	set_task_ioprio(current, old_ioprio);
 	ret = jbd2_fc_end_commit_fallback(journal);
-	ext4_fc_update_stats(sb, status, 0, 0, commit_tid);
+	ext4_fc_update_stats(sb, status, 0, 0, 0, commit_tid);
 	return ret;
 }
 
+
+
 int ext4_fc_commit(journal_t *journal, tid_t commit_tid)
 {
-	int ret;
-	// ktime_t start_time = ktime_get();
+	int ret, fsync_latency;
+	struct ext4_sb_info *sbi = EXT4_SB(journal->j_private);
+
+	ktime_t start_time = ktime_get();
 	ret = __ext4_fc_commit(journal, commit_tid);
-	// printk(KERN_ERR "TOTAL: %lld\n", ktime_to_us(ktime_sub(ktime_get(), start_time)));
+	fsync_latency = ktime_to_us(ktime_sub(ktime_get(), start_time));
+	if (fsync_latency >= 50000)
+		fsync_latency = 49999;
+	sbi->s_fsync_hist[fsync_latency].count++;
 	return ret;
 }
 
@@ -2291,11 +2337,18 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 		return 0;
 
 	seq_printf(seq, "fc stats:\n");
-	seq_printf(seq, "%ld commits (%ld skipped)\n", stats->fc_num_commits, stats->fc_skipped_commits);
-	seq_printf(seq, "%ld ineligible\n", stats->fc_ineligible_commits);
+	seq_printf(seq, "%ld commits (%ld skipped):\n", stats->fc_num_commits, stats->fc_skipped_commits);
+	seq_printf(seq, "\t%ld ineligible\n", stats->fc_ineligible_commits);
+	seq_printf(seq, "\t%ld failed\n", stats->fc_failed_commits);
+	seq_printf(seq, "\t%ld empty\n", stats->empty_commits);
+	seq_printf(seq, "Commit type breakdown:\n");
+	seq_printf(seq, "\t%ld fua\n", stats->single_block_fua);
+	seq_printf(seq, "\t%ld fua+preflush\n", stats->single_block_flush);
+	seq_printf(seq, "\t%ld multiblock\n", stats->multiblock);
 	seq_printf(seq, "%ld numblks\n", stats->fc_numblks);
 	seq_printf(seq, "%ld real_numblks\n", stats->real_numblks);
-	seq_printf(seq, "%ld avg_commit_time\n", div_u64(stats->s_fc_avg_commit_time, 1000));
+	seq_printf(seq, "%ld flushes\n", stats->num_flushes);
+	seq_printf(seq, "%lld avg_commit_time\n", div_u64(stats->s_fc_avg_commit_time, 1000));
 	seq_printf(seq, "time breakdown:\n");
 	seq_printf(seq, "\ttotal: %lld\n", stats->total_commit_time);
 	seq_printf(seq, "\tbegin_time: %lld\n", stats->begin_time);
@@ -2313,6 +2366,11 @@ int ext4_fc_info_show(struct seq_file *seq, void *v)
 	for (i = 0; i < EXT4_FC_REASON_MAX; i++)
 		seq_printf(seq, "\"%s\":\t%d\n", fc_ineligible_reasons[i],
 			stats->fc_ineligible_reason_count[i]);
+	seq_puts(seq, "fsync: \n");
+	for (i = 0; i < 50000; i++) {
+		if (sbi->s_fsync_hist[i].count != 0)
+			seq_printf(seq, "%d,%d\n", i, sbi->s_fsync_hist[i].count);
+	}
 
 	return 0;
 }

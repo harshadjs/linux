@@ -734,7 +734,10 @@ struct transaction_run_stats_s {
 	unsigned long		rs_running;
 	unsigned long		rs_locked;
 	unsigned long		rs_flushing;
-	unsigned long		rs_logging;
+	unsigned long		rs_logging_1;
+	unsigned long		rs_logging_2;
+	unsigned long		rs_logging_3;
+	unsigned long		rs_logging_4;
 
 	__u32			rs_handle_count;
 	__u32			rs_blocks;

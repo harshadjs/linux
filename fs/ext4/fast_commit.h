@@ -119,6 +119,11 @@ struct ext4_fc_stats {
 	unsigned long fc_skipped_commits;
 	unsigned long fc_numblks;
 	unsigned long real_numblks;
+	unsigned long num_flushes;
+	unsigned long empty_commits;
+	unsigned long single_block_fua;
+	unsigned long single_block_flush;
+	unsigned long multiblock;
 	u64 s_fc_avg_commit_time;
 	u64 lock_updates_time;
 	u64 mark_inodes_committing;

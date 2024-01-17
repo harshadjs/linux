@@ -1200,8 +1200,14 @@ static int jbd2_seq_info_show(struct seq_file *seq, void *v)
 	    s->stats->run.rs_locked );
 	seq_printf(seq, "  %luus flushing data (in ordered mode)\n",
 	    s->stats->run.rs_flushing);
-	seq_printf(seq, "  %luus logging transaction\n",
-	    s->stats->run.rs_logging);
+	seq_printf(seq, "  %luus ph1 logging transaction\n",
+	    s->stats->run.rs_logging_1);
+	seq_printf(seq, "  %luus ph2 logging transaction\n",
+	    s->stats->run.rs_logging_2);
+	seq_printf(seq, "  %luus ph3 logging transaction\n",
+	    s->stats->run.rs_logging_3);
+	seq_printf(seq, "  %luus ph4 logging transaction\n",
+	    s->stats->run.rs_logging_4);
 	seq_printf(seq, "  %lluus average transaction commit time\n",
 		   div_u64(s->journal->j_average_commit_time, 1000));
 	seq_printf(seq, "  %lu handles per transaction\n",

@@ -840,6 +840,7 @@ start_journal_io:
 	*/
 
 	jbd2_debug(3, "JBD2: commit phase 3\n");
+	stats.run.rs_logging_1 = get_us_since(&prev);
 
 	while (!list_empty(&io_bufs)) {
 		struct buffer_head *bh = list_entry(io_bufs.prev,
@@ -906,6 +907,8 @@ start_journal_io:
 	if (err)
 		jbd2_journal_abort(journal, err);
 
+	stats.run.rs_logging_2 = get_us_since(&prev);
+
 	jbd2_debug(3, "JBD2: commit phase 5\n");
 	write_lock(&journal->j_state_lock);
 	J_ASSERT(commit_transaction->t_state == T_COMMIT_DFLUSH);
@@ -951,6 +954,8 @@ start_journal_io:
 	J_ASSERT(commit_transaction->t_buffers == NULL);
 	J_ASSERT(commit_transaction->t_checkpoint_list == NULL);
 	J_ASSERT(commit_transaction->t_shadow_list == NULL);
+	stats.run.rs_logging_3 = get_us_since(&prev);
+
 
 restart_loop:
 	/*
@@ -1127,7 +1132,7 @@ restart_loop:
 	J_ASSERT(commit_transaction->t_state == T_COMMIT_JFLUSH);
 
 	commit_transaction->t_start = jiffies;
-	stats.run.rs_logging = get_us_since(&prev);
+	stats.run.rs_logging_4 = get_us_since(&prev);
 
 	/*
 	 * File the transaction statistics
@@ -1195,7 +1200,10 @@ restart_loop:
 	journal->j_stats.run.rs_running += stats.run.rs_running;
 	journal->j_stats.run.rs_locked += stats.run.rs_locked;
 	journal->j_stats.run.rs_flushing += stats.run.rs_flushing;
-	journal->j_stats.run.rs_logging += stats.run.rs_logging;
+	journal->j_stats.run.rs_logging_1 += stats.run.rs_logging_1;
+	journal->j_stats.run.rs_logging_2 += stats.run.rs_logging_2;
+	journal->j_stats.run.rs_logging_3 += stats.run.rs_logging_3;
+	journal->j_stats.run.rs_logging_4 += stats.run.rs_logging_4;
 	journal->j_stats.run.rs_handle_count += stats.run.rs_handle_count;
 	journal->j_stats.run.rs_blocks += stats.run.rs_blocks;
 	journal->j_stats.run.rs_blocks_logged += stats.run.rs_blocks_logged;

@@ -5038,6 +5038,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	ext4_clear_mount_flag(sb, EXT4_MF_FC_INELIGIBLE);
 	sbi->s_fc_ineligible_tid = 0;
 	spin_lock_init(&sbi->s_fc_lock);
+	sbi->s_fsync_hist = kzalloc(sizeof(struct ext4_fsync_hist) * 50000, GFP_KERNEL);
 	memset(&sbi->s_fc_stats, 0, sizeof(sbi->s_fc_stats));
 	sbi->s_fc_replay_state.fc_regions = NULL;
 	sbi->s_fc_replay_state.fc_regions_size = 0;
